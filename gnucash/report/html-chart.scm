@@ -417,9 +417,12 @@ var toLocaleStringSupportsOptions = (typeof Intl == 'object' && Intl && typeof I
 // format a number e.g. 2.5 into monetary e.g. \"$2.50\" or other style formsty
 function numformat(amount) {
   if (toLocaleStringSupportsOptions) {
+      if (formsty == 'percent') {
+          return amount.toLocaleString(undefined, {style:formsty, minimumFractionDigits:2, maximumFractionDigits:2});
+      }
       return amount.toLocaleString(undefined, {style:formsty, currency:curriso});
   } else if (formsty == 'percent') {
-      return (100 * amount).toLocaleString() + '%';
+      return (100 * amount).toFixed(2) + '%';
   } else if (formsty == 'currency') {
       return currsym + amount.toLocaleString();
   } else {

@@ -72,6 +72,8 @@
     (gnc:make-menu gnc:menuname-asset-liability (list gnc:menuname-reports)))
   (define income-expense-menu
     (gnc:make-menu gnc:menuname-income-expense (list gnc:menuname-reports)))
+  (define investments-menu
+    (gnc:make-menu gnc:menuname-investments (list gnc:menuname-reports)))
   (define budget-menu
     (gnc:make-menu gnc:menuname-budget (list gnc:menuname-reports)))
   (define example-menu
@@ -98,6 +100,7 @@
   ;; (gnc-add-scm-extension tax-menu)
   (gnc-add-scm-extension income-expense-menu)
   (gnc-add-scm-extension asset-liability-menu)
+  (gnc-add-scm-extension investments-menu)
   (gnc-add-scm-extension budget-menu)
   (gnc-add-scm-extension example-menu)
   (gnc-add-scm-extension experimental-menu)

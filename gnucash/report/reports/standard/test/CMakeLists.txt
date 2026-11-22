@@ -19,6 +19,7 @@ set(scm_test_with_srfi64_SOURCES
   test-average-balance.scm
   test-ifrs-cost-basis.scm
   test-investment-lots.scm
+  test-investment-return-chart.scm
   test-invoice.scm
   test-new-owner-report.scm
   test-owner-report.scm

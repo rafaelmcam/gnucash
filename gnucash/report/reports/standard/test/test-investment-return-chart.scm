@@ -1,0 +1,647 @@
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; test-investment-return-chart.scm: Tests for Investment Return
+;; Over Time (TWR) chart report.
+;;
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 2 of
+;; the License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with this program; if not, contact:
+;;
+;; Free Software Foundation           Voice:  +1-617-542-5942
+;; 51 Franklin Street, Fifth Floor    Fax:    +1-617-542-2652
+;; Boston, MA  02110-1301,  USA       gnu@gnu.org
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(use-modules (gnucash engine))
+(use-modules (gnucash app-utils))
+(use-modules (gnucash report))
+(use-modules (gnucash report stylesheets plain))
+(use-modules (gnucash reports standard investment-return-chart))
+(use-modules (srfi srfi-1))
+(use-modules (srfi srfi-64))
+(use-modules (tests test-engine-extras))
+(use-modules (tests srfi64-extras))
+(use-modules (tests test-report-extras))
+
+(setlocale LC_ALL "C")
+
+(define (run-test)
+  (test-runner-factory gnc:test-runner)
+  (test-begin "test-investment-return-chart")
+  (qof-date-format-set QOF-DATE-FORMAT-ISO)
+  (null-test)
+  (stock-twr-with-contribution-test)
+  (asset-interest-twr-test)
+  (parent-weighted-twr-test)
+  (internal-transfer-test)
+  (bank-account-twr-test)
+  (stale-price-large-deposit-test)
+  (missing-initial-price-test)
+  (deep-leaf-stock-selection-test)
+  (zero-to-first-deposit-stale-price-test)
+  (csv-export-test)
+  (test-end "test-investment-return-chart"))
+
+(define (set-option! options section name value)
+  (if (gnc-lookup-option (gnc:optiondb options) section name)
+      (gnc-set-option (gnc:optiondb options) section name value)
+      (test-assert (format #f "wrong-option ~a ~a" section name) #f)))
+
+(define (teardown)
+  (gnc-clear-current-session))
+
+(define (null-test)
+  (test-group-with-cleanup "null-test"
+    (let* ((book (gnc-get-current-book))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (test-assert "null-test renders"
+        (gnc:options->sxml investment-return-chart-uuid options
+                           "test-investment-return-chart" "null-test"
+                           #:strip-tag "script")))
+    (teardown)))
+
+(define (setup-stock-contribution-env)
+  (let* ((env (create-test-env))
+         (book (gnc-get-current-book))
+         (USD (gnc-default-report-currency))
+         (comm-table (gnc-commodity-table-get-table book))
+         (AAPL (gnc-commodity-new book "Apple" "NASDAQ" "AAPL" "" 1))
+         (structure
+          (list "Assets" (list (cons 'type ACCT-TYPE-ASSET))
+                (list "Bank" (list (cons 'type ACCT-TYPE-BANK)))
+                (list "Broker"
+                      (list "AAPL" (list (cons 'type ACCT-TYPE-STOCK))))
+                (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+         (account-alist (env-create-account-structure-alist env structure))
+         (bank (cdr (assoc "Bank" account-alist)))
+         (equity (cdr (assoc "Equity" account-alist)))
+         (aapl (cdr (assoc "AAPL" account-alist))))
+    (gnc-commodity-table-insert comm-table AAPL)
+    (xaccAccountSetCommodity aapl AAPL)
+
+    (env-transfer env 01 01 2020 equity bank 10000)
+    ;; Day 1: Buy 10 AAPL @ $100 ($1000)
+    (env-create-multisplit-transaction
+     env 01 01 2020
+     (list (vector bank -1000 -1000)
+           (vector aapl  1000    10))
+     #:description "buy 10 AAPL @ $100")
+    ;; Day 2: Price is $110 (+10%), buy 10 more AAPL @ $110 ($1100 deposit)
+    (env-create-multisplit-transaction
+     env 02 01 2020
+     (list (vector bank -1100 -1100)
+           (vector aapl  1100    10))
+     #:description "buy 10 AAPL @ $110")
+    ;; Day 3: Price rises to $121 (+10% on total -> cumulative TWR +21.00%)
+    (gnc-pricedb-create USD AAPL (gnc-dmy2time64 03 01 2020) 121)
+    account-alist))
+
+(define (stock-twr-with-contribution-test)
+  (test-group-with-cleanup "stock-twr-with-contribution"
+    (let* ((account-alist (setup-stock-contribution-env))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-general "Report's currency"
+                   (gnc-default-report-currency))
+      (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-display "Show table" #t)
+
+      (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                     "test-investment-return-chart"
+                                     "stock-twr" #:strip-tag "script")))
+        (test-equal "headers"
+          '("Date" "AAPL")
+          (sxml->table-row-col sxml 1 0 #f))
+        (test-equal "day 1 0.00%"
+          '("2020-01-01" "0.00%")
+          (sxml->table-row-col sxml 1 1 #f))
+        (test-equal "day 2 10.00%"
+          '("2020-01-02" "10.00%")
+          (sxml->table-row-col sxml 1 2 #f))
+        (test-equal "day 3 21.00%"
+          '("2020-01-03" "21.00%")
+          (sxml->table-row-col sxml 1 3 #f))))
+    (teardown)))
+
+(define (asset-interest-twr-test)
+  (test-group-with-cleanup "asset-interest-twr"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (structure
+            (list "Assets" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "Bank" (list (cons 'type ACCT-TYPE-BANK)))
+                  (list "BondAsset" (list (cons 'type ACCT-TYPE-ASSET)))
+                  (list "Income" (list (cons 'type ACCT-TYPE-INCOME)))
+                  (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (bank (cdr (assoc "Bank" account-alist)))
+           (bond (cdr (assoc "BondAsset" account-alist)))
+           (income (cdr (assoc "Income" account-alist)))
+           (equity (cdr (assoc "Equity" account-alist)))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (env-transfer env 01 01 2020 equity bank 5000)
+      (env-transfer env 01 01 2020 bank bond 1000)
+      (env-transfer env 02 01 2020 income bond 50)
+      (env-transfer env 03 01 2020 bank bond 200)
+
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list bond))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-display "Show table" #t)
+
+      (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                     "test-investment-return-chart"
+                                     "asset-interest" #:strip-tag "script")))
+        (test-equal "day 1 0.00%"
+          '("2020-01-01" "0.00%")
+          (sxml->table-row-col sxml 1 1 #f))
+        (test-equal "day 2 5.00% interest"
+          '("2020-01-02" "5.00%")
+          (sxml->table-row-col sxml 1 2 #f))
+        (test-equal "day 3 5.00% after deposit"
+          '("2020-01-03" "5.00%")
+          (sxml->table-row-col sxml 1 3 #f))))
+    (teardown)))
+
+(define (parent-weighted-twr-test)
+  (test-group-with-cleanup "parent-weighted-twr"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (comm-table (gnc-commodity-table-get-table book))
+           (STKA (gnc-commodity-new book "Stock A" "NASDAQ" "STKA" "" 1))
+           (STKB (gnc-commodity-new book "Stock B" "NASDAQ" "STKB" "" 1))
+           (structure
+            (list "Investments" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "StockA" (list (cons 'type ACCT-TYPE-STOCK)))
+                  (list "StockB" (list (cons 'type ACCT-TYPE-STOCK)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (investments (cdr (assoc "Investments" account-alist)))
+           (stock-a (cdr (assoc "StockA" account-alist)))
+           (stock-b (cdr (assoc "StockB" account-alist)))
+           (bank (env-create-root-account env ACCT-TYPE-BANK USD))
+           (equity (env-create-root-account env ACCT-TYPE-EQUITY USD)))
+      (gnc-commodity-table-insert comm-table STKA)
+      (gnc-commodity-table-insert comm-table STKB)
+      (xaccAccountSetCommodity stock-a STKA)
+      (xaccAccountSetCommodity stock-b STKB)
+
+      (env-transfer env 01 01 2020 equity bank 10000)
+      ;; Initial allocation: StockA = $1000 (25%), StockB = $3000 (75%)
+      (env-create-multisplit-transaction
+       env 01 01 2020
+       (list (vector bank -1000 -1000)
+             (vector stock-a 1000 10)))
+      (env-create-multisplit-transaction
+       env 01 01 2020
+       (list (vector bank -3000 -3000)
+             (vector stock-b 3000 30)))
+      ;; Day 2: StockA +20% ($120), StockB 0% ($100) => weighted return = +5.00%
+      (gnc-pricedb-create USD STKA (gnc-dmy2time64 02 01 2020) 120)
+      (gnc-pricedb-create USD STKB (gnc-dmy2time64 02 01 2020) 100)
+
+      ;; 1) Parent selected directly without selecting children
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 02 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list investments))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show table" #t)
+
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "parent-only" #:strip-tag "script")))
+          (test-equal "parent-only headers"
+            '("Date" "Investments")
+            (sxml->table-row-col sxml 1 0 #f))
+          (test-equal "parent-only day 1"
+            '("2020-01-01" "0.00%")
+            (sxml->table-row-col sxml 1 1 #f))
+          (test-equal "parent-only weighted 5.00%"
+            '("2020-01-02" "5.00%")
+            (sxml->table-row-col sxml 1 2 #f))))
+
+      ;; 2) Parent + children selected with Levels of Subaccounts = 1
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 02 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts"
+                     (list investments stock-a stock-b))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 1)
+        (set-option! options gnc:pagename-display "Show table" #t)
+
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "parent-level-1" #:strip-tag "script")))
+          (test-equal "level-1 weighted 5.00%"
+            '("2020-01-02" "5.00%")
+            (sxml->table-row-col sxml 1 2 #f))))
+
+      ;; 3) Children + Consolidated Portfolio
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 02 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts"
+                     (list investments stock-a stock-b))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show Consolidated Portfolio" #t)
+        (set-option! options gnc:pagename-display "Show table" #t)
+
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "consolidated" #:strip-tag "script")))
+          (test-equal "consolidated headers"
+            '("Date" "StockA" "StockB" "Total Portfolio")
+            (sxml->table-row-col sxml 1 0 #f))
+          (test-equal "consolidated day 2"
+            '("2020-01-02" "20.00%" "0.00%" "5.00%")
+            (sxml->table-row-col sxml 1 2 #f)))))
+    (teardown)))
+
+(define (internal-transfer-test)
+  (test-group-with-cleanup "internal-transfer"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (comm-table (gnc-commodity-table-get-table book))
+           (STKA (gnc-commodity-new book "Stock A" "NASDAQ" "STKA" "" 1))
+           (structure
+            (list "Investments" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "BrokerCash" (list (cons 'type ACCT-TYPE-ASSET)))
+                  (list "StockA" (list (cons 'type ACCT-TYPE-STOCK)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (investments (cdr (assoc "Investments" account-alist)))
+           (cash (cdr (assoc "BrokerCash" account-alist)))
+           (stock-a (cdr (assoc "StockA" account-alist)))
+           (bank (env-create-root-account env ACCT-TYPE-BANK USD))
+           (equity (env-create-root-account env ACCT-TYPE-EQUITY USD))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (gnc-commodity-table-insert comm-table STKA)
+      (xaccAccountSetCommodity stock-a STKA)
+
+      (env-transfer env 01 01 2020 equity bank 5000)
+      ;; Day 1: External deposit $1000 into BrokerCash
+      (env-transfer env 01 01 2020 bank cash 1000)
+      ;; Day 2: Internal transfer $500 from BrokerCash to buy 5 STKA @ $100
+      (env-create-multisplit-transaction
+       env 02 01 2020
+       (list (vector cash -500 -500)
+             (vector stock-a 500 5)))
+      ;; Day 3: STKA rises to $110 ($550 stock + $500 cash = $1050 => +5.00%)
+      (gnc-pricedb-create USD STKA (gnc-dmy2time64 03 01 2020) 110)
+
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list investments))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-display "Show table" #t)
+
+      (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                     "test-investment-return-chart"
+                                     "internal-transfer" #:strip-tag "script")))
+        (test-equal "day 1 0.00%"
+          '("2020-01-01" "0.00%")
+          (sxml->table-row-col sxml 1 1 #f))
+        (test-equal "day 2 internal transfer stays 0.00%"
+          '("2020-01-02" "0.00%")
+          (sxml->table-row-col sxml 1 2 #f))
+        (test-equal "day 3 5.00%"
+          '("2020-01-03" "5.00%")
+          (sxml->table-row-col sxml 1 3 #f))))
+    (teardown)))
+
+(define (bank-account-twr-test)
+  (test-group-with-cleanup "bank-account-twr"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (structure
+            (list "BankFolder" (list (cons 'type ACCT-TYPE-BANK))
+                  (list "SavingsCDB" (list (cons 'type ACCT-TYPE-BANK)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (bank-folder (cdr (assoc "BankFolder" account-alist)))
+           (savings (cdr (assoc "SavingsCDB" account-alist)))
+           (wallet (env-create-root-account env ACCT-TYPE-CASH USD))
+           (income (env-create-root-account env ACCT-TYPE-INCOME USD))
+           (equity (env-create-root-account env ACCT-TYPE-EQUITY USD))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (env-transfer env 01 01 2020 equity wallet 5000)
+      (env-transfer env 01 01 2020 wallet savings 1000)
+      (env-transfer env 02 01 2020 income savings 50)
+      (env-transfer env 03 01 2020 wallet savings 500)
+
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list bank-folder))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-display "Show table" #t)
+
+      (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                     "test-investment-return-chart"
+                                     "bank-account" #:strip-tag "script")))
+        (test-equal "bank headers"
+          '("Date" "BankFolder")
+          (sxml->table-row-col sxml 1 0 #f))
+        (test-equal "bank day 1 0.00%"
+          '("2020-01-01" "0.00%")
+          (sxml->table-row-col sxml 1 1 #f))
+        (test-equal "bank day 2 5.00% interest"
+          '("2020-01-02" "5.00%")
+          (sxml->table-row-col sxml 1 2 #f))
+        (test-equal "bank day 3 5.00% after deposit"
+          '("2020-01-03" "5.00%")
+          (sxml->table-row-col sxml 1 3 #f))))
+    (teardown)))
+
+(define (stale-price-large-deposit-test)
+  (test-group-with-cleanup "stale-price-large-deposit"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (comm-table (gnc-commodity-table-get-table book))
+           (AAPL (gnc-commodity-new book "Apple" "NASDAQ" "AAPL" "" 1))
+           (structure
+            (list "Assets" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "Bank" (list (cons 'type ACCT-TYPE-BANK)))
+                  (list "Broker"
+                        (list "AAPL" (list (cons 'type ACCT-TYPE-STOCK))))
+                  (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (bank (cdr (assoc "Bank" account-alist)))
+           (equity (cdr (assoc "Equity" account-alist)))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (gnc-commodity-table-insert comm-table AAPL)
+      (xaccAccountSetCommodity aapl AAPL)
+
+      (env-transfer env 01 01 2020 equity bank 50000)
+      ;; Day 1: Buy 10 AAPL @ $100 (adds $100 to PriceDB)
+      (env-create-multisplit-transaction
+       env 01 01 2020
+       (list (vector bank -1000 -1000)
+             (vector aapl  1000    10))
+       #:pricedb? #t)
+      ;; Day 2: Buy 100 AAPL @ $105 without updating PriceDB (stale $100)
+      (env-create-multisplit-transaction
+       env 02 01 2020
+       (list (vector bank -10500 -10500)
+             (vector aapl  10500    100))
+       #:pricedb? #f)
+      ;; Day 3: PriceDB updates to $110 (+10%)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 03 01 2020) 110)
+
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-display "Show table" #t)
+
+      (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                     "test-investment-return-chart"
+                                     "stale-price" #:strip-tag "script")))
+        (test-equal "stale price day 1 0.00%"
+          '("2020-01-01" "0.00%")
+          (sxml->table-row-col sxml 1 1 #f))
+        (test-equal "stale price day 2 stays 0.00% (not -50.00%)"
+          '("2020-01-02" "0.00%")
+          (sxml->table-row-col sxml 1 2 #f))
+        (test-equal "stale price day 3 10.00%"
+          '("2020-01-03" "10.00%")
+          (sxml->table-row-col sxml 1 3 #f))))
+    (teardown)))
+
+(define (missing-initial-price-test)
+  (test-group-with-cleanup "missing-initial-price"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (comm-table (gnc-commodity-table-get-table book))
+           (AAPL (gnc-commodity-new book "Apple" "NASDAQ" "AAPL" "" 1))
+           (structure
+            (list "Assets" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "Bank" (list (cons 'type ACCT-TYPE-BANK)))
+                  (list "Broker"
+                        (list "AAPL" (list (cons 'type ACCT-TYPE-STOCK))))
+                  (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (bank (cdr (assoc "Bank" account-alist)))
+           (equity (cdr (assoc "Equity" account-alist)))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (gnc-commodity-table-insert comm-table AAPL)
+      (xaccAccountSetCommodity aapl AAPL)
+
+      (env-transfer env 01 01 2020 equity bank 5000)
+      ;; Day 1: Buy 10 AAPL without any PriceDB price
+      (env-create-multisplit-transaction
+       env 01 01 2020
+       (list (vector bank -1000 -1000)
+             (vector aapl  1000    10))
+       #:pricedb? #f)
+      ;; Day 2: PriceDB gets $100; Day 3: $110 (+10%)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 02 01 2020) 100)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 03 01 2020) 110)
+
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-display "Show table" #t)
+
+      (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                     "test-investment-return-chart"
+                                     "missing-initial-price" #:strip-tag "script")))
+        (test-equal "missing initial price day 1 0.00%"
+          '("2020-01-01" "0.00%")
+          (sxml->table-row-col sxml 1 1 #f))
+        (test-equal "missing initial price day 2 0.00% (not -100%)"
+          '("2020-01-02" "0.00%")
+          (sxml->table-row-col sxml 1 2 #f))
+        (test-equal "missing initial price day 3 10.00%"
+          '("2020-01-03" "10.00%")
+          (sxml->table-row-col sxml 1 3 #f))))
+    (teardown)))
+
+(define (deep-leaf-stock-selection-test)
+  (test-group-with-cleanup "deep-leaf-stock-selection"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (comm-table (gnc-commodity-table-get-table book))
+           (PETR4 (gnc-commodity-new book "Petrobras" "B3" "PETR4" "" 1))
+           (structure
+            (list "Assets" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "Bank" (list (cons 'type ACCT-TYPE-BANK)))
+                  (list "Investments" (list (cons 'type ACCT-TYPE-ASSET))
+                        (list "Stocks" (list (cons 'type ACCT-TYPE-ASSET))
+                              (list "PETR4" (list (cons 'type ACCT-TYPE-STOCK)))))
+                  (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (bank (cdr (assoc "Bank" account-alist)))
+           (equity (cdr (assoc "Equity" account-alist)))
+           (petr4 (cdr (assoc "PETR4" account-alist)))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (gnc-commodity-table-insert comm-table PETR4)
+      (xaccAccountSetCommodity petr4 PETR4)
+
+      (env-transfer env 01 01 2020 equity bank 5000)
+      (env-create-multisplit-transaction
+       env 01 01 2020
+       (list (vector bank -1000 -1000)
+             (vector petr4 1000   100)))
+      (gnc-pricedb-create USD PETR4 (gnc-dmy2time64 02 01 2020) 11)
+
+      ;; Select ONLY the depth-4 leaf STOCK account, leaving Levels of Subaccounts at default (2)
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 02 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list petr4))
+      (set-option! options gnc:pagename-display "Show table" #t)
+
+      (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                     "test-investment-return-chart"
+                                     "deep-leaf-stock" #:strip-tag "script")))
+        (test-equal "deep leaf headers"
+          '("Date" "PETR4")
+          (sxml->table-row-col sxml 1 0 #f))
+        (test-equal "deep leaf day 1 0.00%"
+          '("2020-01-01" "0.00%")
+          (sxml->table-row-col sxml 1 1 #f))
+        (test-equal "deep leaf day 2 10.00%"
+          '("2020-01-02" "10.00%")
+          (sxml->table-row-col sxml 1 2 #f))))
+    (teardown)))
+
+(define (zero-to-first-deposit-stale-price-test)
+  (test-group-with-cleanup "zero-to-first-deposit-stale-price"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (comm-table (gnc-commodity-table-get-table book))
+           (AAPL (gnc-commodity-new book "Apple" "NASDAQ" "AAPL" "" 1))
+           (structure
+            (list "Assets" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "Bank" (list (cons 'type ACCT-TYPE-BANK)))
+                  (list "Broker"
+                        (list "AAPL" (list (cons 'type ACCT-TYPE-STOCK))))
+                  (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (bank (cdr (assoc "Bank" account-alist)))
+           (equity (cdr (assoc "Equity" account-alist)))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (gnc-commodity-table-insert comm-table AAPL)
+      (xaccAccountSetCommodity aapl AAPL)
+
+      (env-transfer env 01 01 2020 equity bank 5000)
+      ;; Day 1: Account has 0 balance while PriceDB already has an older price $90
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 01 01 2020) 90)
+      ;; Day 2: First purchase of 10 AAPL @ $100 (CF = $1000) without updating PriceDB
+      (env-create-multisplit-transaction
+       env 02 01 2020
+       (list (vector bank -1000 -1000)
+             (vector aapl  1000    10))
+       #:pricedb? #f)
+      ;; Day 3: PriceDB updates to $102 (+2.00% over $100 cost basis)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 03 01 2020) 102)
+
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-display "Show table" #t)
+
+      (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                     "test-investment-return-chart"
+                                     "zero-to-first-deposit" #:strip-tag "script")))
+        (test-equal "zero-to-first-deposit day 1 0.00%"
+          '("2020-01-01" "0.00%")
+          (sxml->table-row-col sxml 1 1 #f))
+        (test-equal "zero-to-first-deposit day 2 0.00%"
+          '("2020-01-02" "0.00%")
+          (sxml->table-row-col sxml 1 2 #f))
+        (test-equal "zero-to-first-deposit day 3 2.00% (not 13.33%)"
+          '("2020-01-03" "2.00%")
+          (sxml->table-row-col sxml 1 3 #f))))
+    (teardown)))
+
+(define (csv-export-test)
+  (test-group-with-cleanup "csv-export"
+    (let* ((account-alist (setup-stock-contribution-env))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+
+      (let* ((template (gnc:find-report-template investment-return-chart-uuid))
+             (report-id (gnc:make-report investment-return-chart-uuid options))
+             (report (gnc-report-find report-id))
+             (export-thunk (gnc:report-template-export-thunk template))
+             (document (export-thunk report 'csv)))
+        (test-assert "csv output has no export error"
+          (not (gnc:html-document-export-error document)))
+        (test-equal "csv output matches TWR series"
+          "\"Date\",\"AAPL\"\n\"2020-01-01\",0.0\n\"2020-01-02\",10.0\n\"2020-01-03\",21.0"
+          (gnc:html-document-export-string document))))
+    (teardown)))

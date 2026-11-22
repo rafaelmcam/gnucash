@@ -38,6 +38,7 @@ set (reports_standard_SCHEME
     standard/income-gst-statement.scm
     standard/income-statement.scm
     standard/investment-lots.scm
+    standard/investment-return-chart.scm
     standard/lot-viewer.scm
     standard/net-charts.scm
     standard/portfolio.scm
