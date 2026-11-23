@@ -20,6 +20,7 @@
 ;; Boston, MA  02110-1301,  USA       gnu@gnu.org
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(use-modules (gnucash core-utils))
 (use-modules (gnucash engine))
 (use-modules (gnucash app-utils))
 (use-modules (gnucash report))
@@ -48,6 +49,8 @@
   (deep-leaf-stock-selection-test)
   (zero-to-first-deposit-stale-price-test)
   (excluded-income-expense-accounts-test)
+  (benchmark-cdi-and-ticker-test)
+  (report-action-anchor-test)
   (csv-export-test)
   (test-end "test-investment-return-chart"))
 
@@ -684,6 +687,142 @@
         (test-equal "day 5 selected tax -1.00% -> 3.95%"
           '("2020-01-05" "3.95%")
           (sxml->table-row-col sxml 1 5 #f))))
+    (teardown)))
+
+(define (ensure-dir path)
+  (unless (file-exists? path)
+    (ensure-dir (dirname path))
+    (mkdir path)))
+
+(define (with-temp-file path content thunk)
+  (let ((had-prev? (file-exists? path))
+        (prev-content #f))
+    (when had-prev?
+      (set! prev-content
+        (call-with-input-file path
+          (lambda (p)
+            (let lp ((acc '()))
+              (let ((c (read-char p)))
+                (if (eof-object? c)
+                    (list->string (reverse acc))
+                    (lp (cons c acc)))))))))
+    (dynamic-wind
+      (lambda ()
+        (ensure-dir (dirname path))
+        (call-with-output-file path
+          (lambda (p) (display content p))))
+      thunk
+      (lambda ()
+        (if had-prev?
+            (call-with-output-file path
+              (lambda (p) (display prev-content p)))
+            (when (file-exists? path)
+              (delete-file path)))))))
+
+(define (benchmark-cdi-and-ticker-test)
+  (test-group-with-cleanup "benchmark-cdi-and-ticker"
+    (let* ((account-alist (setup-stock-contribution-env))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (bench-dir (gnc-build-userdata-path "benchmarks"))
+           (cdi-path (string-append bench-dir "/CDI.csv"))
+           (ibov-path (string-append bench-dir "/IBOVESPA.csv"))
+           (divo-path (string-append bench-dir "/YAHOO_DIVO11.SA.csv"))
+           (cdi-csv (string-append
+                     "# fetched: 2019-12-22..2020-01-03\n"
+                     "date,value\n"
+                     "2020-01-01,10.0\n"
+                     "2020-01-02,10.0\n"
+                     "2020-01-03,10.0\n"))
+           (ibov-csv (string-append
+                      "# fetched: 2019-12-22..2020-01-03\n"
+                      "date,value\n"
+                      "2020-01-01,100000\n"
+                      "2020-01-02,105000\n"
+                      "2020-01-03,110000\n"))
+           (divo-csv (string-append
+                      "# fetched: 2019-12-22..2020-01-03\n"
+                      "date,value\n"
+                      "2020-01-01,50\n"
+                      "2020-01-02,51\n"
+                      "2020-01-03,55\n"))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-display "Show table" #t)
+      (set-option! options "Benchmarks" "Show CDI" #t)
+      (set-option! options "Benchmarks" "Show IBOVESPA" #t)
+      (set-option! options "Benchmarks" "Custom Yahoo Finance Tickers" "DIVO11.SA")
+
+      (with-temp-file cdi-path cdi-csv
+        (lambda ()
+          (with-temp-file ibov-path ibov-csv
+            (lambda ()
+              (with-temp-file divo-path divo-csv
+                (lambda ()
+                  (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                                 "test-investment-return-chart"
+                                                 "benchmark-cdi-ticker"
+                                                 #:strip-tag "script")))
+                    (test-equal "benchmark headers"
+                      '("Date" "AAPL" "CDI" "IBOVESPA" "DIVO11.SA")
+                      (sxml->table-row-col sxml 1 0 #f))
+                    (test-equal "benchmark day 1 all 0.00%"
+                      '("2020-01-01" "0.00%" "0.00%" "0.00%" "0.00%")
+                      (sxml->table-row-col sxml 1 1 #f))
+                    (test-equal "benchmark day 2"
+                      '("2020-01-02" "10.00%" "10.00%" "5.00%" "2.00%")
+                      (sxml->table-row-col sxml 1 2 #f))
+                    (test-equal "benchmark day 3"
+                      '("2020-01-03" "21.00%" "21.00%" "10.00%" "10.00%")
+                      (sxml->table-row-col sxml 1 3 #f)))
+
+                  (let* ((template (gnc:find-report-template investment-return-chart-uuid))
+                         (report-id (gnc:make-report investment-return-chart-uuid options))
+                         (report (gnc-report-find report-id))
+                         (export-thunk (gnc:report-template-export-thunk template))
+                         (document (export-thunk report 'csv)))
+                    (test-assert "benchmark csv has no export error"
+                      (not (gnc:html-document-export-error document)))
+                    (test-equal "benchmark csv matches series"
+                      (string-append
+                       "\"Date\",\"AAPL\",\"CDI\",\"IBOVESPA\",\"DIVO11.SA\"\n"
+                       "\"2020-01-01\",0.0,0.0,0.0,0.0\n"
+                       "\"2020-01-02\",10.0,10.0,5.0,2.0\n"
+                       "\"2020-01-03\",21.0,21.0,10.0,10.0")
+                      (gnc:html-document-export-string document))))))))))
+    (teardown)))
+
+(define (report-action-anchor-test)
+  (test-group-with-cleanup "report-action-anchor"
+    (let* ((book (gnc-get-current-book))
+           (options (gnc:make-report-options investment-return-chart-uuid))
+           (report-id (gnc:make-report investment-return-chart-uuid options))
+           (report (gnc-report-find report-id))
+           (calls 0)
+           (url (gnc:make-report-action-anchor
+                 report
+                 (lambda () (set! calls (1+ calls)))))
+           (id-str (substring url (string-contains url "id=")))
+           (pipe-pos (string-index id-str #\|))
+           (hash-pos (string-index id-str #\# pipe-pos))
+           (anchor-id (string->number
+                       (substring id-str (1+ pipe-pos)
+                                  (or hash-pos (string-length id-str))))))
+      (test-equal "first invocation returns src-id"
+        report-id
+        (gnc:report-get-linked-report report-id anchor-id))
+      (test-equal "second invocation returns src-id without re-running thunk"
+        report-id
+        (gnc:report-get-linked-report report-id anchor-id))
+      (test-equal "thunk invoked exactly once"
+        1
+        calls))
     (teardown)))
 
 (define (csv-export-test)

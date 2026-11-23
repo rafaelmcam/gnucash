@@ -45,6 +45,7 @@
 (export gnc:transaction-doclink-anchor-text)
 (export gnc:report-anchor-text)
 (export gnc:make-report-anchor)
+(export gnc:make-report-action-anchor)
 (export gnc:html-account-anchor)
 (export gnc:html-split-anchor)
 (export gnc:html-transaction-anchor)
@@ -171,18 +172,41 @@
                     src-report (list reportname (gnc:report-options src-report) optionlist))))
     (gnc-build-url URL-TYPE-REPORT (format #f "id=~a|~a" (gnc:report-id src-report) anchor-id) "")))
 
+(define *active-action-reports* (make-hash-table))
+
+(define (gnc:make-report-action-anchor src-report thunk)
+  (let* ((executed? #f)
+         (guarded-thunk (lambda ()
+                          (unless executed?
+                            (set! executed? #t)
+                            (thunk))))
+         (anchor-id (gnc:report-add-anchor!
+                     src-report (list 'action guarded-thunk))))
+    (gnc-build-url URL-TYPE-REPORT (format #f "id=~a|~a" (gnc:report-id src-report) anchor-id) "")))
+
 (define-public (gnc:report-get-linked-report src-id id)
-  (match (gnc:report-get-anchor (gnc-report-find src-id) id)
-    ((reportname src-options optionlist)
-     (let* ((options (gnc:make-report-options reportname))
-            (db (gnc:optiondb options)))
+  (let ((src-report (gnc-report-find src-id)))
+    (match (and src-report (gnc:report-get-anchor src-report id))
+      ((reportname src-options optionlist)
+       (let* ((options (gnc:make-report-options reportname))
+              (db (gnc:optiondb options)))
+         (cond
+          (options
+           (gnc:options-copy-values src-options options)
+           (for-each (lambda (l) (apply gnc-set-option db l)) optionlist)
+           (gnc:make-report reportname options))
+          (else (gnc:error "cannot find temport template " reportname) #f))))
+      (('action thunk)
        (cond
-        (options
-         (gnc:options-copy-values src-options options)
-         (for-each (lambda (l) (apply gnc-set-option db l)) optionlist)
-         (gnc:make-report reportname options))
-        (else (gnc:error "cannot find temport template " reportname) #f))))
-    (_ (gnc:error "invalid src-id " src-id " id " id) #f)))
+        ((hashv-ref *active-action-reports* src-id)
+         (hashv-remove! *active-action-reports* src-id)
+         src-id)
+        (else
+         (thunk)
+         (hashv-set! *active-action-reports* src-id #t)
+         (gnc:report-set-dirty?! src-report #t)
+         src-id)))
+      (_ (gnc:error "invalid src-id " src-id " id " id) #f))))
 
 ;; returns the account name as html-text and anchor to the register.
 (define (gnc:html-account-anchor acct)

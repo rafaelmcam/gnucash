@@ -500,6 +500,7 @@ gnucash/report/reports/standard/trial-balance.scm
 gnucash/report/reports/standard/txn-columns.scm
 gnucash/report/reports/standard/view-column.scm
 gnucash/report/reports/support/balsheet-eg.eguile.scm
+gnucash/report/reports/support/benchmark-fetch.py
 gnucash/report/reports/support/receipt.eguile.scm
 gnucash/report/reports/support/taxinvoice.eguile.scm
 gnucash/report/report.scm

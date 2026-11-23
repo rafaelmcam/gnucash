@@ -28,9 +28,13 @@
 (use-modules (gnucash core-utils))
 (use-modules (gnucash app-utils))
 (use-modules (gnucash report))
+(use-modules (gnucash json parser))
 (use-modules (srfi srfi-1))
+(use-modules (srfi srfi-13))
 (use-modules (srfi srfi-26))
 (use-modules (ice-9 format))
+(use-modules (ice-9 popen))
+(use-modules (ice-9 rdelim))
 
 (export investment-return-chart-uuid)
 
@@ -67,6 +71,14 @@
 (define optname-y-grid (N_ "Grid"))
 (define optname-tooltip-indexed (N_ "Show a grouped (indexed) tooltip"))
 (define optname-tooltip-non-zero-only (N_ "Show only non-zero values in a tooltip"))
+
+(define pagename-benchmarks (N_ "Benchmarks"))
+(define optname-show-cdi (N_ "Show CDI"))
+(define optname-show-ibov (N_ "Show IBOVESPA"))
+(define optname-show-sp500 (N_ "Show S&P 500 (BRL)"))
+(define optname-custom-tickers (N_ "Custom Yahoo Finance Tickers"))
+
+(define *benchmark-fetch-status* (make-hash-table))
 
 (define (options-generator)
   (let* ((options (gnc-new-optiondb)))
@@ -147,6 +159,25 @@
       gnc:pagename-display optname-tooltip-non-zero-only
       "t2" (N_ "Show only non-zero values in a tooltip.") #f)
 
+    ;; Benchmarks tab
+    (gnc-register-simple-boolean-option options
+      pagename-benchmarks optname-show-cdi
+      "a" (N_ "Overlay cumulative CDI return (fetched from BCB SGS) on the chart.") #f)
+
+    (gnc-register-simple-boolean-option options
+      pagename-benchmarks optname-show-ibov
+      "b" (N_ "Overlay IBOVESPA (^BVSP) cumulative return on the chart.") #f)
+
+    (gnc-register-simple-boolean-option options
+      pagename-benchmarks optname-show-sp500
+      "c" (N_ "Overlay S&P 500 converted to BRL (^GSPC * USDBRL=X) cumulative return on the chart.") #f)
+
+    (gnc-register-string-option options
+      pagename-benchmarks optname-custom-tickers
+      "d"
+      (N_ "Comma-separated Yahoo Finance tickers to compare (e.g. DIVO11.SA, BOVA11.SA).")
+      "")
+
     (gnc:options-set-default-section options gnc:pagename-general)
 
     options))
@@ -159,6 +190,183 @@
       (loop (cdr rest) acc))
      (else
       (loop (cdr rest) (cons (car rest) acc))))))
+
+(define (sanitize-ticker ticker)
+  (string-map
+   (lambda (c)
+     (if (or (and (char>=? c #\A) (char<=? c #\Z))
+             (and (char>=? c #\a) (char<=? c #\z))
+             (and (char>=? c #\0) (char<=? c #\9))
+             (memv c '(#\. #\_ #\-)))
+         c
+         #\_))
+   ticker))
+
+(define (read-all-from-port port)
+  (let loop ((lines '()))
+    (let ((line (read-line port 'concat)))
+      (if (eof-object? line)
+          (string-concatenate-reverse lines)
+          (loop (cons line lines))))))
+
+(define (read-benchmark-cache cache-path)
+  (if (not (file-exists? cache-path))
+      (list #f #f '())
+      (call-with-input-file cache-path
+        (lambda (port)
+          (let loop ((f-start #f) (f-end #f) (rows '()))
+            (let ((line (read-line port)))
+              (cond
+               ((eof-object? line)
+                (list f-start f-end
+                      (sort rows (lambda (a b) (string<? (car a) (car b))))))
+               (else
+                (let ((trimmed (string-trim-both line)))
+                  (cond
+                   ((string-prefix? "# fetched:" trimmed)
+                    (let* ((range-str (string-trim-both
+                                       (substring trimmed (string-length "# fetched:"))))
+                           (sep (string-contains range-str "..")))
+                      (if sep
+                          (loop (substring range-str 0 sep)
+                                (substring range-str (+ sep 2))
+                                rows)
+                          (loop f-start f-end rows))))
+                   ((or (string-null? trimmed)
+                        (string-prefix? "#" trimmed)
+                        (string=? trimmed "date,value"))
+                    (loop f-start f-end rows))
+                   (else
+                    (let ((comma (string-index trimmed #\,)))
+                      (if comma
+                          (let ((d (string-trim-both (substring trimmed 0 comma)))
+                                (v (string->number
+                                    (string-trim-both (substring trimmed (1+ comma))))))
+                            (if (and (not (string-null? d)) v)
+                                (loop f-start f-end (cons (cons d v) rows))
+                                (loop f-start f-end rows)))
+                          (loop f-start f-end rows))))))))))))))
+
+(define (benchmark-needs-fetch? f-start f-end from-iso to-iso today-iso)
+  (let ((eff-end (if (string<=? to-iso today-iso) to-iso today-iso)))
+    (and (string<=? from-iso eff-end)
+         (or (not f-start)
+             (not f-end)
+             (string>? f-start from-iso)
+             (string<? f-end eff-end)))))
+
+(define (compute-cdi-return-series rows date-isos)
+  (if (null? rows)
+      #f
+      (let* ((t0-iso (car date-isos))
+             (tn-iso (last date-isos))
+             (active-rows (filter (lambda (r)
+                                    (and (string>? (car r) t0-iso)
+                                         (string<=? (car r) tn-iso)))
+                                  rows)))
+        (let loop ((dates date-isos)
+                   (rs active-rows)
+                   (factor 1.0)
+                   (acc '()))
+          (if (null? dates)
+              (reverse acc)
+              (let ((d-iso (car dates)))
+                (let inner ((rs rs) (f factor))
+                  (if (and (pair? rs) (string<=? (caar rs) d-iso))
+                      (inner (cdr rs) (* f (+ 1.0 (/ (exact->inexact (cdar rs)) 100.0))))
+                      (loop (cdr dates) rs f (cons (- f 1.0) acc))))))))))
+
+(define (compute-price-benchmark-series rows date-isos)
+  (if (null? rows)
+      #f
+      (let* ((t0-iso (car date-isos))
+             (tn-iso (last date-isos))
+             (prior (filter (lambda (r) (string<=? (car r) t0-iso)) rows))
+             (in-range (filter (lambda (r)
+                                 (and (string>? (car r) t0-iso)
+                                      (string<=? (car r) tn-iso)))
+                               rows))
+             (base-row (cond
+                        ((pair? prior) (last prior))
+                        ((pair? in-range) (car in-range))
+                        (else #f))))
+        (if (or (not base-row) (<= (cdr base-row) 0.0))
+            #f
+            (let ((base (exact->inexact (cdr base-row))))
+              (let loop ((dates date-isos)
+                         (rs rows)
+                         (curr-price #f)
+                         (acc '()))
+                (if (null? dates)
+                    (reverse acc)
+                    (let ((d-iso (car dates)))
+                      (let inner ((rs rs) (p curr-price))
+                        (if (and (pair? rs) (string<=? (caar rs) d-iso))
+                            (inner (cdr rs) (exact->inexact (cdar rs)))
+                            (let ((ret (if p (- (/ p base) 1.0) 0.0)))
+                              (loop (cdr dates) rs p (cons ret acc)))))))))))))
+
+(define (read-trimmed-first-line path)
+  (and (file-exists? path)
+       (call-with-input-file path
+         (lambda (port)
+           (let ((line (read-line port)))
+             (and (string? line)
+                  (let ((trimmed (string-trim-both line)))
+                    (and (not (string-null? trimmed)) trimmed))))))))
+
+(define (resolve-benchmark-python)
+  (let* ((env-py (getenv "GNC_BENCHMARK_PYTHON"))
+         (local-venv-py (gnc-build-scm-path "gnucash/reports/support/.venv/bin/python"))
+         (configured-py (read-trimmed-first-line
+                         (gnc-build-scm-path "gnucash/reports/support/benchmark-python.txt"))))
+    (cond
+     ((and env-py (not (string-null? env-py)) (file-exists? env-py)) env-py)
+     ((file-exists? local-venv-py) local-venv-py)
+     ((and configured-py (file-exists? configured-py)) configured-py)
+     (else "python3"))))
+
+(define (run-benchmark-fetch cache-dir from-iso to-iso specs)
+  (let ((script-path (gnc-build-scm-path "gnucash/reports/support/benchmark-fetch.py"))
+        (python-exe (resolve-benchmark-python)))
+    (if (not (file-exists? script-path))
+        (format #f (G_ "Fetcher script not found: ~a") script-path)
+        (catch #t
+          (lambda ()
+            (let* ((port (apply open-pipe* OPEN_READ
+                                python-exe script-path
+                                "--cache-dir" cache-dir
+                                "--start" from-iso
+                                "--end" to-iso
+                                specs))
+                   (output (read-all-from-port port))
+                   (status (close-pipe port))
+                   (exit-code (status:exit-val status)))
+              (if (and exit-code (zero? exit-code))
+                  (let* ((parsed (json-string->scm output))
+                         (raw-results (assoc-ref parsed "results"))
+                         (results (cond
+                                   ((vector? raw-results) (vector->list raw-results))
+                                   ((list? raw-results) raw-results)
+                                   (else '()))))
+                    (string-join
+                     (map (lambda (item)
+                            (let ((spec (or (assoc-ref item "spec") "?"))
+                                  (st (or (assoc-ref item "status") "?"))
+                                  (err (assoc-ref item "error")))
+                              (cond
+                               ((equal? st "error")
+                                (format #f "~a: ~a (~a)" spec (G_ "error") (or err "")))
+                               ((equal? st "cached")
+                                (format #f "~a: ~a" spec (G_ "up to date")))
+                               (else
+                                (format #f "~a: ~a (+~a)" spec (G_ "updated")
+                                        (or (assoc-ref item "added") 0))))))
+                          results)
+                     " | "))
+                  (format #f (G_ "Fetch failed (exit ~a): ~a") exit-code output))))
+          (lambda (key . args)
+            (format #f (G_ "Fetch error: ~a ~a") key args))))))
 
 (define (investment-return-renderer report-obj export-type)
 
@@ -191,6 +399,32 @@
          (tooltip-indexed (get-option gnc:pagename-display optname-tooltip-indexed))
          (tooltip-non-zero-only (get-option gnc:pagename-display optname-tooltip-non-zero-only))
 
+         (show-cdi? (get-option pagename-benchmarks optname-show-cdi))
+         (show-ibov? (get-option pagename-benchmarks optname-show-ibov))
+         (show-sp500? (get-option pagename-benchmarks optname-show-sp500))
+         (custom-tickers-str (get-option pagename-benchmarks optname-custom-tickers))
+         (custom-tickers
+          (delete-duplicates
+           (filter (negate string-null?)
+                   (map string-trim-both
+                        (string-split (or custom-tickers-str "") #\,)))
+           string=?))
+         (enabled-benchmarks
+          (delete-duplicates
+           (append
+            (if show-cdi? (list (list "CDI" "CDI" "CDI" 'cdi)) '())
+            (if show-ibov? (list (list "IBOVESPA" "IBOVESPA" "IBOVESPA" 'price)) '())
+            (if show-sp500?
+                (list (list "SP500_BRL" "SP500_BRL" (G_ "S&P 500 (BRL)") 'price))
+                '())
+            (map (lambda (t)
+                   (list (string-append "YAHOO:" t)
+                         (string-append "YAHOO_" (sanitize-ticker t))
+                         t
+                         'price))
+                 custom-tickers))
+           (lambda (a b) (string=? (cadr a) (cadr b)))))
+
          (document (gnc:make-html-document))
          (chart (gnc:make-html-chart)))
 
@@ -209,7 +443,7 @@
       (if show-fullname? gnc-account-get-full-name xaccAccountGetName))
 
     (cond
-     ((null? accounts)
+     ((and (null? accounts) (null? enabled-benchmarks))
       (gnc:html-document-add-object!
        document
        (gnc:html-make-no-account-warning
@@ -224,7 +458,10 @@
         (G_ "Start date must be earlier than End date"))))
 
      (else
-      (let* ((all-candidate-accounts (gnc-accounts-and-all-descendants accounts))
+      (let* ((all-candidate-accounts
+              (if (null? accounts)
+                  '()
+                  (gnc-accounts-and-all-descendants accounts)))
              (commodity-list (gnc:accounts-get-commodities
                               all-candidate-accounts
                               report-currency))
@@ -236,6 +473,12 @@
                           (gnc:time64-end-day-time from-date-t64)
                           (gnc:time64-end-day-time to-date-t64)
                           (gnc:deltasym-to-delta interval)))
+             (iso-date (qof-date-format-get-string QOF-DATE-FORMAT-ISO))
+             (date-isos (map (cut gnc-print-time64 <> iso-date) dates-list))
+             (from-iso (car date-isos))
+             (to-iso (last date-isos))
+             (today-iso (gnc-print-time64 (gnc:get-today) iso-date))
+             (cache-dir (gnc-build-userdata-path "benchmarks"))
              (date-string-list (map qof-print-date dates-list))
              (topl-accounts (filter
                              (lambda (a)
@@ -477,19 +720,78 @@
 
         (gnc:report-percent-done 15)
         (set! work-to-do (count-accounts 1 topl-accounts))
-        (let* ((series-entries (traverse-accounts 1 topl-accounts))
-               (all-data
+        (let* ((series-entries
+                (if (null? accounts)
+                    '()
+                    (map (lambda (e)
+                           (list 'account (car e) (acct->name (car e)) (caddr e) (cadr e)))
+                         (traverse-accounts 1 topl-accounts))))
+               (portfolio-entries
                 (if (and show-total? (> (length series-entries) 1))
                     (let* ((total-accts (delete-duplicates
-                                         (append-map cadr series-entries)
+                                         (append-map (cut list-ref <> 4) series-entries)
                                          equal?))
                            (total-twr (compute-twr-series total-accts)))
                       (if total-twr
                           (append series-entries
-                                  (list (list (G_ "Total Portfolio") total-accts total-twr)))
+                                  (list (list 'total #f (G_ "Total Portfolio") total-twr total-accts)))
                           series-entries))
-                    series-entries)))
+                    series-entries))
+               (missing-benchmarks '())
+               (benchmark-entries
+                (filter-map
+                 (lambda (b)
+                   (let* ((key (cadr b))
+                          (label (caddr b))
+                          (kind (cadddr b))
+                          (cache-path (string-append cache-dir "/" key ".csv"))
+                          (cached (read-benchmark-cache cache-path))
+                          (f-start (car cached))
+                          (f-end (cadr cached))
+                          (rows (caddr cached))
+                          (series (if (eq? kind 'cdi)
+                                      (compute-cdi-return-series rows date-isos)
+                                      (compute-price-benchmark-series rows date-isos))))
+                     (when (benchmark-needs-fetch? f-start f-end from-iso to-iso today-iso)
+                       (set! missing-benchmarks (cons label missing-benchmarks)))
+                     (and series (list 'benchmark #f label series '()))))
+                 enabled-benchmarks))
+               (all-data (append portfolio-entries benchmark-entries)))
           (gnc:report-percent-done 85)
+
+          (when (and (pair? enabled-benchmarks) (not (eq? export-type 'csv)))
+            (let* ((fetch-specs (map car enabled-benchmarks))
+                   (fetch-url (gnc:make-report-action-anchor
+                               report-obj
+                               (lambda ()
+                                 (let ((msg (run-benchmark-fetch
+                                             cache-dir from-iso to-iso fetch-specs)))
+                                   (hashv-set! *benchmark-fetch-status*
+                                               (gnc:report-id report-obj)
+                                               msg)))))
+                   (last-status (hashv-ref *benchmark-fetch-status*
+                                           (gnc:report-id report-obj)))
+                   (cache-summary
+                    (if (null? missing-benchmarks)
+                        (G_ "All selected benchmarks cached for this period.")
+                        (format #f (G_ "Missing cached data for: ~a")
+                                (string-join (reverse missing-benchmarks) ", "))))
+                   (status-text (if last-status
+                                    (string-append last-status " — " cache-summary)
+                                    cache-summary)))
+              (gnc:html-document-add-object!
+               document
+               (gnc:make-html-text
+                (gnc:html-markup/attr
+                 "div"
+                 "style='margin-bottom:8px;padding:6px 10px;background:#f5f5f5;border:1px solid #ddd;border-radius:4px;font-size:0.9em;'"
+                 (gnc:html-markup/attr
+                  "a"
+                  (format #f "href=~s style='display:inline-block;padding:4px 10px;background:#0074D9;color:#ffffff;text-decoration:none;border-radius:3px;font-weight:bold;margin-right:10px;'"
+                          fetch-url)
+                  (G_ "Fetch / Update Benchmarks"))
+                 (gnc:html-markup/attr "span" "style='color:#333333;'" status-text))))))
+
           (cond
            ((null? all-data)
             (gnc:html-document-add-object!
@@ -498,12 +800,8 @@
               report-title (gnc:report-id report-obj))))
 
            (else
-            (let* ((series-names
-                    (map (lambda (entry)
-                           (let ((acct (car entry)))
-                             (if (string? acct) acct (acct->name acct))))
-                         all-data))
-                   (series-values (map caddr all-data))
+            (let* ((series-names (map caddr all-data))
+                   (series-values (map cadddr all-data))
                    (list-of-rows (apply zip series-values)))
 
               (gnc:html-chart-set-type! chart 'line)
@@ -529,10 +827,11 @@
 
               (for-each
                (lambda (entry label color)
-                 (let* ((acct (car entry))
-                        (twr (caddr entry))
+                 (let* ((kind (car entry))
+                        (acct (cadr entry))
+                        (twr (cadddr entry))
                         (urls (cond
-                               ((string? acct) #f)
+                               ((not (eq? kind 'account)) #f)
                                ((or (null? (gnc-account-get-children acct))
                                     (>= tree-depth 6))
                                 (gnc:account-anchor-text acct))
@@ -547,16 +846,24 @@
                                   (list gnc:pagename-general
                                         gnc:optname-reportname
                                         (acct->name acct))))))))
-                   (if urls
-                       (gnc:html-chart-add-data-series!
-                        chart label twr color
-                        'fill #f
-                        'borderWidth line-width
-                        'urls urls)
-                       (gnc:html-chart-add-data-series!
-                        chart label twr color
-                        'fill #f
-                        'borderWidth line-width))))
+                   (cond
+                    ((eq? kind 'benchmark)
+                     (gnc:html-chart-add-data-series!
+                      chart label twr color
+                      'fill #f
+                      'borderWidth line-width
+                      'borderDash '(6 4)))
+                    (urls
+                     (gnc:html-chart-add-data-series!
+                      chart label twr color
+                      'fill #f
+                      'borderWidth line-width
+                      'urls urls))
+                    (else
+                     (gnc:html-chart-add-data-series!
+                      chart label twr color
+                      'fill #f
+                      'borderWidth line-width)))))
                all-data
                series-names
                (gnc:assign-colors (length all-data)))
@@ -588,18 +895,17 @@
                   (gnc:html-document-add-object! document table)))
 
               (when (eq? export-type 'csv)
-                (let ((iso-date (qof-date-format-get-string QOF-DATE-FORMAT-ISO)))
-                  (gnc:html-document-set-export-string
-                   document
-                   (gnc:lists->csv
-                    (cons (cons (G_ "Date") series-names)
-                          (map (lambda (d row)
-                                 (cons (gnc-print-time64 d iso-date)
-                                       (map (lambda (val)
-                                              (/ (round (* val 1000000.0)) 10000.0))
-                                            row)))
-                               dates-list
-                               list-of-rows)))))))))))))
+                (gnc:html-document-set-export-string
+                 document
+                 (gnc:lists->csv
+                  (cons (cons (G_ "Date") series-names)
+                        (map (lambda (d-iso row)
+                               (cons d-iso
+                                     (map (lambda (val)
+                                            (/ (round (* val 1000000.0)) 10000.0))
+                                          row)))
+                             date-isos
+                             list-of-rows))))))))))))
 
     (unless (gnc:html-document-export-string document)
       (gnc:html-document-set-export-error document (G_ "No exportable data")))
