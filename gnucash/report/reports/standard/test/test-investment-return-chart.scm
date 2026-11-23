@@ -47,6 +47,7 @@
   (missing-initial-price-test)
   (deep-leaf-stock-selection-test)
   (zero-to-first-deposit-stale-price-test)
+  (excluded-income-expense-accounts-test)
   (csv-export-test)
   (test-end "test-investment-return-chart"))
 
@@ -618,6 +619,71 @@
         (test-equal "zero-to-first-deposit day 3 2.00% (not 13.33%)"
           '("2020-01-03" "2.00%")
           (sxml->table-row-col sxml 1 3 #f))))
+    (teardown)))
+
+(define (excluded-income-expense-accounts-test)
+  (test-group-with-cleanup "excluded-income-expense-accounts"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (structure
+            (list "Root" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "Savings" (list (cons 'type ACCT-TYPE-BANK)))
+                  (list "Income" (list (cons 'type ACCT-TYPE-INCOME))
+                        (list "Interest")
+                        (list "Salary"))
+                  (list "Expenses" (list (cons 'type ACCT-TYPE-EXPENSE))
+                        (list "Tax")
+                        (list "Groceries"))
+                  (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (savings (cdr (assoc "Savings" account-alist)))
+           (interest (cdr (assoc "Interest" account-alist)))
+           (salary (cdr (assoc "Salary" account-alist)))
+           (tax (cdr (assoc "Tax" account-alist)))
+           (groceries (cdr (assoc "Groceries" account-alist)))
+           (equity (cdr (assoc "Equity" account-alist)))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      ;; Day 1: Initial deposit $1000 from Equity -> Savings (0.00%)
+      (env-transfer env 01 01 2020 equity savings 1000)
+      ;; Day 2: Deselected Income:Salary $1000 -> Savings (external deposit, stays 0.00%, base $2000)
+      (env-transfer env 02 01 2020 salary savings 1000)
+      ;; Day 3: Selected Income:Interest $100 -> Savings (+5.00% on $2000, base $2100)
+      (env-transfer env 03 01 2020 interest savings 100)
+      ;; Day 4: Deselected Expenses:Groceries $500 <- Savings (external withdrawal, stays 5.00%, base $1600)
+      (env-transfer env 04 01 2020 savings groceries 500)
+      ;; Day 5: Selected Expenses:Tax $16 <- Savings (-1.00% fee on $1600 -> 1.05 * 0.99 - 1 = 3.95%)
+      (env-transfer env 05 01 2020 savings tax 16)
+
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 05 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list savings))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-accounts "Income/Expense Accounts in Return"
+                   (list interest tax))
+      (set-option! options gnc:pagename-display "Show table" #t)
+
+      (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                     "test-investment-return-chart"
+                                     "excluded-inc-exp" #:strip-tag "script")))
+        (test-equal "day 1 0.00%"
+          '("2020-01-01" "0.00%")
+          (sxml->table-row-col sxml 1 1 #f))
+        (test-equal "day 2 deselected salary treated as cash flow"
+          '("2020-01-02" "0.00%")
+          (sxml->table-row-col sxml 1 2 #f))
+        (test-equal "day 3 selected interest +5.00%"
+          '("2020-01-03" "5.00%")
+          (sxml->table-row-col sxml 1 3 #f))
+        (test-equal "day 4 deselected groceries treated as withdrawal"
+          '("2020-01-04" "5.00%")
+          (sxml->table-row-col sxml 1 4 #f))
+        (test-equal "day 5 selected tax -1.00% -> 3.95%"
+          '("2020-01-05" "3.95%")
+          (sxml->table-row-col sxml 1 5 #f))))
     (teardown)))
 
 (define (csv-export-test)

@@ -44,6 +44,9 @@
 (define investment-account-types
   (list ACCT-TYPE-ASSET ACCT-TYPE-BANK ACCT-TYPE-STOCK ACCT-TYPE-MUTUAL))
 
+(define return-account-types
+  (list ACCT-TYPE-INCOME ACCT-TYPE-EXPENSE))
+
 (define optname-from-date (N_ "Start Date"))
 (define optname-to-date (N_ "End Date"))
 (define optname-stepsize (N_ "Step Size"))
@@ -52,6 +55,7 @@
 
 (define optname-accounts (N_ "Accounts"))
 (define optname-levels (N_ "Levels of Subaccounts"))
+(define optname-return-accounts (N_ "Income/Expense Accounts in Return"))
 
 (define optname-fullname (N_ "Show long account names"))
 (define optname-show-total (N_ "Show Consolidated Portfolio"))
@@ -96,6 +100,15 @@
      options gnc:pagename-accounts optname-levels "c"
      (N_ "Maximum number of levels in the account tree displayed.")
      2)
+
+    (gnc-register-account-list-limited-option options
+      gnc:pagename-accounts optname-return-accounts
+      "d"
+      (N_ "Income and expense accounts whose transactions count toward investment return. Deselected income and expense accounts are treated as external cash flows (deposits or withdrawals).")
+      (gnc:filter-accountlist-type
+       return-account-types
+       (gnc-account-get-descendants-sorted (gnc-get-current-root-account)))
+      return-account-types)
 
     ;; Display tab
     (gnc-register-simple-boolean-option options
@@ -166,6 +179,7 @@
 
          (accounts (get-option gnc:pagename-accounts optname-accounts))
          (account-levels (get-option gnc:pagename-accounts optname-levels))
+         (return-accounts (get-option gnc:pagename-accounts optname-return-accounts))
 
          (show-fullname? (get-option gnc:pagename-display optname-fullname))
          (show-total? (get-option gnc:pagename-display optname-show-total))
@@ -229,6 +243,9 @@
                                    (any show-acct? (gnc-account-get-descendants a))))
                              (gnc-account-get-children-sorted
                               (gnc-get-current-root-account))))
+             (return-acct-set (let ((h (make-hash-table)))
+                                (for-each (cut hash-set! h <> #t) return-accounts)
+                                h))
              (work-done 0)
              (work-to-do 0))
 
@@ -288,10 +305,9 @@
                                  (let ((sa (xaccSplitGetAccount s)))
                                    (if (and (not (null? sa))
                                             (not (hash-ref acct-set sa))
-                                            (not (member (xaccAccountGetType sa)
-                                                         (list ACCT-TYPE-INCOME
-                                                               ACCT-TYPE-EXPENSE
-                                                               ACCT-TYPE-TRADING))))
+                                            (not (eqv? (xaccAccountGetType sa)
+                                                       ACCT-TYPE-TRADING))
+                                            (not (hash-ref return-acct-set sa)))
                                        (+ sum (xaccSplitGetValue s))
                                        sum)))
                                0
