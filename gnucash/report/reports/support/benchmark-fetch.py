@@ -17,6 +17,8 @@ import urllib.request
 USER_AGENT = "Mozilla/5.0"
 LOOKBACK_DAYS = 10
 BCB_CHUNK_DAYS = 1800
+TRAILING_OVERLAP_DAYS = 5
+ADJCLOSE_DRIFT_TOL = 0.001
 
 
 def spec_to_key(spec):
@@ -81,7 +83,7 @@ def save_cache(cache_path, fetched_start, fetched_end, rows):
     os.replace(tmp_path, cache_path)
 
 
-def compute_missing_intervals(start_eff, end_eff, fetched_start, fetched_end):
+def compute_missing_intervals(start_eff, end_eff, fetched_start, fetched_end, today=None, latest_row_date=None):
     if start_eff > end_eff:
         return []
     if fetched_start is None or fetched_end is None:
@@ -90,8 +92,29 @@ def compute_missing_intervals(start_eff, end_eff, fetched_start, fetched_end):
     if start_eff < fetched_start:
         intervals.append((start_eff, fetched_start - datetime.timedelta(days=1)))
     if end_eff > fetched_end:
-        intervals.append((fetched_end + datetime.timedelta(days=1), end_eff))
+        overlap_start = max(start_eff, fetched_end - datetime.timedelta(days=TRAILING_OVERLAP_DAYS))
+        intervals.append((overlap_start, end_eff))
+    elif (
+        today is not None
+        and end_eff == today
+        and fetched_end >= today
+        and (latest_row_date is None or latest_row_date < today)
+    ):
+        overlap_start = max(start_eff, today - datetime.timedelta(days=TRAILING_OVERLAP_DAYS))
+        intervals.append((overlap_start, end_eff))
     return [(a, b) for (a, b) in intervals if a <= b]
+
+
+def has_historical_rescaling(spec, old_rows, new_rows, prev_fetched_end):
+    if spec == "CDI" or prev_fetched_end is None or not old_rows:
+        return False
+    cutoff = prev_fetched_end.isoformat()
+    for d_iso, new_val in new_rows.items():
+        if d_iso < cutoff and d_iso in old_rows:
+            old_val = old_rows[d_iso]
+            if old_val > 0.0 and abs(new_val - old_val) / old_val > ADJCLOSE_DRIFT_TOL:
+                return True
+    return False
 
 
 def http_get_json(url, headers=None, timeout=20):
@@ -223,7 +246,17 @@ def update_benchmark(spec, cache_dir, start_date, end_date, today=None):
     start_eff = min(start_date - datetime.timedelta(days=LOOKBACK_DAYS), end_eff)
 
     fetched_start, fetched_end, rows = load_cache(cache_path)
-    missing = compute_missing_intervals(start_eff, end_eff, fetched_start, fetched_end)
+    prev_fetched_start = fetched_start
+    prev_fetched_end = fetched_end
+    latest_row_date = datetime.date.fromisoformat(max(rows.keys())) if rows else None
+    missing = compute_missing_intervals(
+        start_eff,
+        end_eff,
+        fetched_start,
+        fetched_end,
+        today=today,
+        latest_row_date=latest_row_date,
+    )
     if not missing:
         return {
             "spec": spec,
@@ -234,14 +267,37 @@ def update_benchmark(spec, cache_dir, start_date, end_date, today=None):
         }
 
     added = 0
+    changed = 0
     for m_start, m_end in missing:
         new_rows = fetch_spec_interval(spec, m_start, m_end)
+        if has_historical_rescaling(spec, rows, new_rows, prev_fetched_end):
+            full_start = min(start_eff, prev_fetched_start) if prev_fetched_start is not None else start_eff
+            full_end = max(end_eff, prev_fetched_end)
+            rows = fetch_spec_interval(spec, full_start, full_end)
+            fetched_start = full_start
+            fetched_end = full_end
+            added = len(rows)
+            changed = len(rows)
+            break
         for k, v in new_rows.items():
-            if k not in rows:
+            prev_val = rows.get(k)
+            if prev_val is None:
                 added += 1
+                changed += 1
+            elif not math.isclose(prev_val, v, rel_tol=1e-9, abs_tol=1e-10):
+                changed += 1
             rows[k] = v
         fetched_start = m_start if fetched_start is None else min(fetched_start, m_start)
         fetched_end = m_end if fetched_end is None else max(fetched_end, m_end)
+
+    if added == 0 and changed == 0 and fetched_start == prev_fetched_start and fetched_end == prev_fetched_end:
+        return {
+            "spec": spec,
+            "key": key,
+            "status": "cached",
+            "points": len(rows),
+            "added": 0,
+        }
 
     save_cache(cache_path, fetched_start, fetched_end, rows)
     return {

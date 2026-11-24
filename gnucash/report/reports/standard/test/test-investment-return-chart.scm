@@ -49,6 +49,9 @@
   (deep-leaf-stock-selection-test)
   (zero-to-first-deposit-stale-price-test)
   (excluded-income-expense-accounts-test)
+  (multisplit-edge-cases-test)
+  (liquidation-and-boundary-edge-cases-test)
+  (cdi-out-of-range-cache-test)
   (benchmark-cdi-and-ticker-test)
   (report-action-anchor-test)
   (csv-export-test)
@@ -687,6 +690,457 @@
         (test-equal "day 5 selected tax -1.00% -> 3.95%"
           '("2020-01-05" "3.95%")
           (sxml->table-row-col sxml 1 5 #f))))
+    (teardown)))
+
+(define (multisplit-edge-cases-test)
+  (test-group-with-cleanup "multisplit-edge-cases"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (comm-table (gnc-commodity-table-get-table book))
+           (AAPL (gnc-commodity-new book "Apple" "NASDAQ" "AAPL" "" 1))
+           (structure
+            (list "Root" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "Checking" (list (cons 'type ACCT-TYPE-BANK)))
+                  (list "CDBs" (list (cons 'type ACCT-TYPE-ASSET))
+                        (list "CDB1" (list (cons 'type ACCT-TYPE-ASSET)))
+                        (list "CDB2" (list (cons 'type ACCT-TYPE-ASSET))))
+                  (list "CDBFee" (list (cons 'type ACCT-TYPE-ASSET)))
+                  (list "AAPL" (list (cons 'type ACCT-TYPE-STOCK)))
+                  (list "Income" (list (cons 'type ACCT-TYPE-INCOME))
+                        (list "Interest")
+                        (list "Dividend")
+                        (list "CapGain"))
+                  (list "Expenses" (list (cons 'type ACCT-TYPE-EXPENSE))
+                        (list "IRRF")
+                        (list "Fee"))
+                  (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (checking (cdr (assoc "Checking" account-alist)))
+           (cdb1 (cdr (assoc "CDB1" account-alist)))
+           (cdb2 (cdr (assoc "CDB2" account-alist)))
+           (cdb-fee (cdr (assoc "CDBFee" account-alist)))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (interest (cdr (assoc "Interest" account-alist)))
+           (dividend (cdr (assoc "Dividend" account-alist)))
+           (capgain (cdr (assoc "CapGain" account-alist)))
+           (irrf (cdr (assoc "IRRF" account-alist)))
+           (fee (cdr (assoc "Fee" account-alist)))
+           (equity (cdr (assoc "Equity" account-alist))))
+      (gnc-commodity-table-insert comm-table AAPL)
+      (xaccAccountSetCommodity aapl AAPL)
+      (env-transfer env 01 01 2020 equity checking 50000)
+
+      ;; 1) Sibling interest + IRRF split across CDB1 (1000) and CDB2 (2000)
+      (env-transfer env 01 01 2020 checking cdb1 1000)
+      (env-transfer env 01 01 2020 checking cdb2 2000)
+      (env-create-multisplit-transaction
+       env 02 01 2020
+       (list (vector interest -150 -150)
+             (vector irrf       25   25)
+             (vector cdb1       50   50)
+             (vector cdb2       75   75))
+       #:currency USD)
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 02 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list cdb1 cdb2))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show Consolidated Portfolio" #t)
+        (set-option! options gnc:pagename-display "Show table" #t)
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "ms-sibling-irrf" #:strip-tag "script")))
+          (test-equal "sibling irrf headers"
+            '("Date" "CDB1" "CDB2" "Total Portfolio")
+            (sxml->table-row-col sxml 1 0 #f))
+          (test-equal "sibling irrf day 2"
+            '("2020-01-02" "5.00%" "3.75%" "4.17%")
+            (sxml->table-row-col sxml 1 2 #f))))
+
+      ;; 2) Buy with brokerage fee from zero and on existing position
+      ;; Day 1: empty (0.00%)
+      ;; Day 2: Buy 10 AAPL @ 100 + 20 fee (CF=1020, fee=-20 -> -1.96%)
+      ;; Day 3: Buy 10 AAPL @ 100 + 20 fee (1000/1020 * 2000/2020 - 1 = -2.93%)
+      ;; Day 4: PriceDB -> 110 (+10% -> +6.78%)
+      (env-create-multisplit-transaction
+       env 02 01 2020
+       (list (vector checking -1020 -1020)
+             (vector aapl      1000    10)
+             (vector fee         20    20))
+       #:pricedb? #f)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 02 01 2020) 100)
+      (env-create-multisplit-transaction
+       env 03 01 2020
+       (list (vector checking -1020 -1020)
+             (vector aapl      1000    10)
+             (vector fee         20    20))
+       #:pricedb? #f)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 03 01 2020) 100)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 04 01 2020) 110)
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 04 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show table" #t)
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "ms-buy-fee" #:strip-tag "script")))
+          (test-equal "buy fee day 1"
+            '("2020-01-01" "0.00%")
+            (sxml->table-row-col sxml 1 1 #f))
+          (test-equal "buy fee day 2"
+            '("2020-01-02" "-1.96%")
+            (sxml->table-row-col sxml 1 2 #f))
+          (test-equal "buy fee day 3"
+            '("2020-01-03" "-2.93%")
+            (sxml->table-row-col sxml 1 3 #f))
+          (test-equal "buy fee day 4"
+            '("2020-01-04" "6.78%")
+            (sxml->table-row-col sxml 1 4 #f))))
+
+      ;; 3) Partial redemption with IRRF
+      (env-transfer env 01 01 2020 checking cdb-fee 1000)
+      (env-transfer env 02 01 2020 interest cdb-fee 100)
+      (env-create-multisplit-transaction
+       env 03 01 2020
+       (list (vector checking 539  539)
+             (vector irrf      11   11)
+             (vector cdb-fee -550 -550)))
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list cdb-fee))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show table" #t)
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "ms-redemption-irrf" #:strip-tag "script")))
+          (test-equal "redemption irrf day 2 10.00%"
+            '("2020-01-02" "10.00%")
+            (sxml->table-row-col sxml 1 2 #f))
+          (test-equal "redemption irrf day 3 8.90%"
+            '("2020-01-03" "8.90%")
+            (sxml->table-row-col sxml 1 3 #f))))
+
+      ;; 4) Dummy 0-share/0-value dividend split on AAPL + 5) 5-split stock sale with capgain & fee
+      ;; Reset a fresh sub-period starting 2021-01-01 using AAPL (20 shares held -> sell down or use fresh book):
+      )
+    (teardown))
+  ;; Separate clean books for 4) dummy dividend split and 5) 5-split realized capgain sale
+  (test-group-with-cleanup "multisplit-dummy-dividend-and-capgain"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (comm-table (gnc-commodity-table-get-table book))
+           (AAPL (gnc-commodity-new book "Apple" "NASDAQ" "AAPL" "" 1))
+           (MSFT (gnc-commodity-new book "Microsoft" "NASDAQ" "MSFT" "" 1))
+           (structure
+            (list "Root" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "Checking" (list (cons 'type ACCT-TYPE-BANK)))
+                  (list "AAPL" (list (cons 'type ACCT-TYPE-STOCK)))
+                  (list "MSFT" (list (cons 'type ACCT-TYPE-STOCK)))
+                  (list "Income" (list (cons 'type ACCT-TYPE-INCOME))
+                        (list "Dividend")
+                        (list "CapGain"))
+                  (list "Expenses" (list (cons 'type ACCT-TYPE-EXPENSE))
+                        (list "Fee"))
+                  (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (checking (cdr (assoc "Checking" account-alist)))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (msft (cdr (assoc "MSFT" account-alist)))
+           (dividend (cdr (assoc "Dividend" account-alist)))
+           (capgain (cdr (assoc "CapGain" account-alist)))
+           (fee (cdr (assoc "Fee" account-alist)))
+           (equity (cdr (assoc "Equity" account-alist))))
+      (gnc-commodity-table-insert comm-table AAPL)
+      (gnc-commodity-table-insert comm-table MSFT)
+      (xaccAccountSetCommodity aapl AAPL)
+      (xaccAccountSetCommodity msft MSFT)
+      (env-transfer env 01 01 2020 equity checking 50000)
+
+      ;; 4) Dummy 0-share/0-value dividend split
+      (env-create-multisplit-transaction
+       env 01 01 2020
+       (list (vector checking -1000 -1000)
+             (vector aapl      1000    10))
+       #:pricedb? #f)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 01 01 2020) 100)
+      (env-create-multisplit-transaction
+       env 02 01 2020
+       (list (vector checking  50  50)
+             (vector aapl       0   0)
+             (vector dividend -50 -50))
+       #:pricedb? #f)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 03 01 2020) 110)
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show table" #t)
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "ms-dummy-div" #:strip-tag "script")))
+          (test-equal "dummy div day 2 0.00%"
+            '("2020-01-02" "0.00%")
+            (sxml->table-row-col sxml 1 2 #f))
+          (test-equal "dummy div day 3 10.00%"
+            '("2020-01-03" "10.00%")
+            (sxml->table-row-col sxml 1 3 #f))))
+
+      ;; 5) 5-split stock sale with realized capital gain + brokerage fee
+      (env-create-multisplit-transaction
+       env 01 01 2020
+       (list (vector checking -1000 -1000)
+             (vector msft      1000    10))
+       #:pricedb? #f)
+      (gnc-pricedb-create USD MSFT (gnc-dmy2time64 01 01 2020) 100)
+      (gnc-pricedb-create USD MSFT (gnc-dmy2time64 02 01 2020) 120)
+      (env-create-multisplit-transaction
+       env 02 01 2020
+       (list (vector checking 588 588)
+             (vector fee       12  12)
+             (vector msft    -600  -5)
+             (vector msft     100   0)
+             (vector capgain -100 -100))
+       #:pricedb? #f)
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list msft))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show table" #t)
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "ms-5split-sale" #:strip-tag "script")))
+          (test-equal "5-split sale day 2 18.80%"
+            '("2020-01-02" "18.80%")
+            (sxml->table-row-col sxml 1 2 #f))
+          (test-equal "5-split sale day 3 stays 18.80%"
+            '("2020-01-03" "18.80%")
+            (sxml->table-row-col sxml 1 3 #f)))))
+    (teardown)))
+
+(define (liquidation-and-boundary-edge-cases-test)
+  (test-group-with-cleanup "liquidation-and-boundary-edge-cases"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (USD (gnc-default-report-currency))
+           (comm-table (gnc-commodity-table-get-table book))
+           (AAPL (gnc-commodity-new book "Apple" "NASDAQ" "AAPL" "" 1))
+           (GOOG (gnc-commodity-new book "Google" "NASDAQ" "GOOG" "" 1))
+           (structure
+            (list "Root" (list (cons 'type ACCT-TYPE-ASSET))
+                  (list "Bank" (list (cons 'type ACCT-TYPE-BANK)))
+                  (list "AAPL" (list (cons 'type ACCT-TYPE-STOCK)))
+                  (list "GOOG" (list (cons 'type ACCT-TYPE-STOCK)))
+                  (list "CDB" (list (cons 'type ACCT-TYPE-ASSET)))
+                  (list "CDBLoss" (list (cons 'type ACCT-TYPE-ASSET)))
+                  (list "Income" (list (cons 'type ACCT-TYPE-INCOME))
+                        (list "Interest"))
+                  (list "Expenses" (list (cons 'type ACCT-TYPE-EXPENSE))
+                        (list "Fee")
+                        (list "Loss"))
+                  (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY)))))
+           (account-alist (env-create-account-structure-alist env structure))
+           (bank (cdr (assoc "Bank" account-alist)))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (goog (cdr (assoc "GOOG" account-alist)))
+           (cdb (cdr (assoc "CDB" account-alist)))
+           (cdb-loss (cdr (assoc "CDBLoss" account-alist)))
+           (interest (cdr (assoc "Interest" account-alist)))
+           (fee (cdr (assoc "Fee" account-alist)))
+           (loss (cdr (assoc "Loss" account-alist)))
+           (equity (cdr (assoc "Equity" account-alist))))
+      (gnc-commodity-table-insert comm-table AAPL)
+      (gnc-commodity-table-insert comm-table GOOG)
+      (xaccAccountSetCommodity aapl AAPL)
+      (xaccAccountSetCommodity goog GOOG)
+      (env-transfer env 01 01 2020 equity bank 50000)
+
+      ;; 1) Full liquidation with stale PriceDB + re-entry
+      (env-create-multisplit-transaction
+       env 01 01 2020
+       (list (vector bank -1000 -1000)
+             (vector aapl  1000    10))
+       #:pricedb? #f)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 01 01 2020) 100)
+      (env-create-multisplit-transaction
+       env 02 01 2020
+       (list (vector bank  1200 1200)
+             (vector aapl -1200  -10))
+       #:pricedb? #f)
+      (env-create-multisplit-transaction
+       env 04 01 2020
+       (list (vector bank -1500 -1500)
+             (vector aapl  1500    10))
+       #:pricedb? #f)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 04 01 2020) 150)
+      (gnc-pricedb-create USD AAPL (gnc-dmy2time64 05 01 2020) 165)
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 05 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show table" #t)
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "full-liquidation" #:strip-tag "script")))
+          (test-equal "liquidation day 1 0.00%"
+            '("2020-01-01" "0.00%")
+            (sxml->table-row-col sxml 1 1 #f))
+          (test-equal "liquidation day 2 20.00% despite stale price"
+            '("2020-01-02" "20.00%")
+            (sxml->table-row-col sxml 1 2 #f))
+          (test-equal "liquidation day 3 stays 20.00%"
+            '("2020-01-03" "20.00%")
+            (sxml->table-row-col sxml 1 3 #f))
+          (test-equal "re-entry day 4 stays 20.00%"
+            '("2020-01-04" "20.00%")
+            (sxml->table-row-col sxml 1 4 #f))
+          (test-equal "re-entry day 5 rises to 32.00%"
+            '("2020-01-05" "32.00%")
+            (sxml->table-row-col sxml 1 5 #f))))
+
+      ;; 2) Missing initial price + 2nd deposit
+      (env-create-multisplit-transaction
+       env 01 01 2020
+       (list (vector bank -1000 -1000)
+             (vector goog  1000    10))
+       #:pricedb? #f)
+      (gnc-pricedb-create USD GOOG (gnc-dmy2time64 02 01 2020) 100)
+      (env-create-multisplit-transaction
+       env 02 01 2020
+       (list (vector bank -1000 -1000)
+             (vector goog  1000    10))
+       #:pricedb? #f)
+      (gnc-pricedb-create USD GOOG (gnc-dmy2time64 03 01 2020) 100)
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list goog))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show table" #t)
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "missing-init-2nd-dep" #:strip-tag "script")))
+          (test-equal "missing init + 2nd dep day 1 0.00%"
+            '("2020-01-01" "0.00%")
+            (sxml->table-row-col sxml 1 1 #f))
+          (test-equal "missing init + 2nd dep day 2 0.00%"
+            '("2020-01-02" "0.00%")
+            (sxml->table-row-col sxml 1 2 #f))
+          (test-equal "missing init + 2nd dep day 3 0.00% (not 100%)"
+            '("2020-01-03" "0.00%")
+            (sxml->table-row-col sxml 1 3 #f))))
+
+      ;; 3) Tiny residual balance + large deposit + separate fee on same day
+      (env-transfer env 01 01 2020 bank cdb 5)
+      (env-transfer env 02 01 2020 bank cdb 10000)
+      (env-transfer env 02 01 2020 cdb fee 15)
+      (env-transfer env 03 01 2020 interest cdb 999)
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list cdb))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show table" #t)
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "tiny-residual-fee" #:strip-tag "script")))
+          (test-equal "tiny residual day 2 -0.15% (not -100%)"
+            '("2020-01-02" "-0.15%")
+            (sxml->table-row-col sxml 1 2 #f))
+          (test-equal "tiny residual day 3 9.84%"
+            '("2020-01-03" "9.84%")
+            (sxml->table-row-col sxml 1 3 #f))))
+
+      ;; 4) Genuine total loss (zero holdings with cf = 0)
+      (env-transfer env 01 01 2020 bank cdb-loss 100)
+      (env-transfer env 02 01 2020 cdb-loss loss 100)
+      (let ((options (gnc:make-report-options investment-return-chart-uuid)))
+        (set-option! options gnc:pagename-general "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+        (set-option! options gnc:pagename-general "End Date"
+                     (cons 'absolute (gnc-dmy2time64 02 01 2020)))
+        (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+        (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+        (set-option! options gnc:pagename-accounts "Accounts" (list cdb-loss))
+        (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+        (set-option! options gnc:pagename-display "Show table" #t)
+        (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                       "test-investment-return-chart"
+                                       "genuine-total-loss" #:strip-tag "script")))
+          (test-equal "total loss day 2 -100.00%"
+            '("2020-01-02" "-100.00%")
+            (sxml->table-row-col sxml 1 2 #f)))))
+    (teardown)))
+
+(define (cdi-out-of-range-cache-test)
+  (test-group-with-cleanup "cdi-out-of-range-cache"
+    (let* ((account-alist (setup-stock-contribution-env))
+           (aapl (cdr (assoc "AAPL" account-alist)))
+           (bench-dir (gnc-build-userdata-path "benchmarks"))
+           (cdi-path (string-append bench-dir "/CDI.csv"))
+           (cdi-csv (string-append
+                     "# fetched: 2019-12-20..2019-12-30\n"
+                     "date,value\n"
+                     "2019-12-30,0.02\n"))
+           (options (gnc:make-report-options investment-return-chart-uuid)))
+      (set-option! options gnc:pagename-general "Start Date"
+                   (cons 'absolute (gnc-dmy2time64 01 01 2020)))
+      (set-option! options gnc:pagename-general "End Date"
+                   (cons 'absolute (gnc-dmy2time64 03 01 2020)))
+      (set-option! options gnc:pagename-general "Step Size" 'DayDelta)
+      (set-option! options gnc:pagename-general "Price Source" 'pricedb-before)
+      (set-option! options gnc:pagename-accounts "Accounts" (list aapl))
+      (set-option! options gnc:pagename-accounts "Levels of Subaccounts" 'all)
+      (set-option! options gnc:pagename-display "Show table" #t)
+      (set-option! options "Benchmarks" "Show CDI" #t)
+
+      (with-temp-file cdi-path cdi-csv
+        (lambda ()
+          (let ((sxml (gnc:options->sxml investment-return-chart-uuid options
+                                         "test-investment-return-chart"
+                                         "cdi-out-of-range" #:strip-tag "script")))
+            (test-equal "out-of-range cdi omitted from headers"
+              '("Date" "AAPL")
+              (sxml->table-row-col sxml 1 0 #f))))))
     (teardown)))
 
 (define (ensure-dir path)

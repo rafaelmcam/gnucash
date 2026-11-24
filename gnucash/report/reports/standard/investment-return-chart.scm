@@ -191,6 +191,14 @@
      (else
       (loop (cdr rest) (cons (car rest) acc))))))
 
+(define (time64-midday t64)
+  (let ((bdt (gnc-localtime t64)))
+    (set-tm:sec bdt 0)
+    (set-tm:min bdt 0)
+    (set-tm:hour bdt 12)
+    (set-tm:isdst bdt -1)
+    (gnc-mktime bdt)))
+
 (define (sanitize-ticker ticker)
   (string-map
    (lambda (c)
@@ -264,17 +272,19 @@
                                     (and (string>? (car r) t0-iso)
                                          (string<=? (car r) tn-iso)))
                                   rows)))
-        (let loop ((dates date-isos)
-                   (rs active-rows)
-                   (factor 1.0)
-                   (acc '()))
-          (if (null? dates)
-              (reverse acc)
-              (let ((d-iso (car dates)))
-                (let inner ((rs rs) (f factor))
-                  (if (and (pair? rs) (string<=? (caar rs) d-iso))
-                      (inner (cdr rs) (* f (+ 1.0 (/ (exact->inexact (cdar rs)) 100.0))))
-                      (loop (cdr dates) rs f (cons (- f 1.0) acc))))))))))
+        (if (and (null? active-rows) (string<? t0-iso tn-iso))
+            #f
+            (let loop ((dates date-isos)
+                       (rs active-rows)
+                       (factor 1.0)
+                       (acc '()))
+              (if (null? dates)
+                  (reverse acc)
+                  (let ((d-iso (car dates)))
+                    (let inner ((rs rs) (f factor))
+                      (if (and (pair? rs) (string<=? (caar rs) d-iso))
+                          (inner (cdr rs) (* f (+ 1.0 (/ (exact->inexact (cdar rs)) 100.0))))
+                          (loop (cdr dates) rs f (cons (- f 1.0) acc)))))))))))
 
 (define (compute-price-benchmark-series rows date-isos)
   (if (null? rows)
@@ -469,10 +479,12 @@
                            price-source report-currency
                            commodity-list to-date-t64
                            5 15))
-             (dates-list (gnc:make-date-list
-                          (gnc:time64-end-day-time from-date-t64)
-                          (gnc:time64-end-day-time to-date-t64)
-                          (gnc:deltasym-to-delta interval)))
+             (dates-list (dedupe-sorted-numbers
+                          (map gnc:time64-end-day-time
+                               (gnc:make-date-list
+                                (time64-midday from-date-t64)
+                                (time64-midday to-date-t64)
+                                (gnc:deltasym-to-delta interval)))))
              (iso-date (qof-date-format-get-string QOF-DATE-FORMAT-ISO))
              (date-isos (map (cut gnc-print-time64 <> iso-date) dates-list))
              (from-iso (car date-isos))
@@ -527,7 +539,8 @@
                 (acct-set (make-hash-table))
                 (seen-txns (make-hash-table))
                 (cf-by-date (make-hash-table))
-                (inc-exp-by-date (make-hash-table)))
+                (pre-ie-by-date (make-hash-table))
+                (post-ie-by-date (make-hash-table)))
             (for-each (cut hash-set! acct-set <> #t) account-set)
             (for-each
              (lambda (acc)
@@ -542,63 +555,59 @@
                       (hash-set! seen-txns trans #t)
                       (let* ((trans-curr (xaccTransGetCurrency trans))
                              (splits (xaccTransGetSplitList trans))
-                             (ext-sum
-                              (fold
-                               (lambda (s sum)
-                                 (let ((sa (xaccSplitGetAccount s)))
-                                   (if (and (not (null? sa))
-                                            (not (hash-ref acct-set sa))
-                                            (not (eqv? (xaccAccountGetType sa)
-                                                       ACCT-TYPE-TRADING))
-                                            (not (hash-ref return-acct-set sa)))
-                                       (+ sum (xaccSplitGetValue s))
-                                       sum)))
-                               0
-                               splits))
-                             (cf-raw (- ext-sum))
                              (cf-date (gnc:time64-end-day-time tx-date)))
-                        (cond
-                         ((not (zero? cf-raw))
-                          (let* ((cf-mon (gnc:make-gnc-monetary trans-curr cf-raw))
-                                 (cf-conv (gnc-numeric-convert
-                                           (gnc:gnc-monetary-amount
-                                            (exchange-fn cf-mon report-currency cf-date))
-                                           (gnc-commodity-get-fraction report-currency)
-                                           GNC-RND-ROUND)))
-                            (hashv-set! cf-by-date cf-date
-                                        (+ (or (hashv-ref cf-by-date cf-date) 0)
-                                           cf-conv))))
-                         ((any (lambda (s)
-                                 (let ((sa (xaccSplitGetAccount s)))
-                                   (and (not (null? sa))
-                                        (hash-ref acct-set sa)
-                                        (not (zero? (xaccSplitGetAmount s))))))
-                               splits)
-                          (let ((net-acct-val
-                                 (fold
-                                  (lambda (s sum)
-                                    (let ((sa (xaccSplitGetAccount s)))
-                                      (if (and (not (null? sa))
-                                               (hash-ref acct-set sa))
-                                          (+ sum (xaccSplitGetValue s))
-                                          sum)))
-                                  0
-                                  splits)))
-                            (when (not (zero? net-acct-val))
-                              (let* ((ie-mon (gnc:make-gnc-monetary trans-curr net-acct-val))
-                                     (ie-conv (gnc-numeric-convert
-                                               (gnc:gnc-monetary-amount
-                                                (exchange-fn ie-mon report-currency cf-date))
-                                               (gnc-commodity-get-fraction report-currency)
-                                               GNC-RND-ROUND)))
-                                (hashv-set! inc-exp-by-date cf-date
-                                            (+ (or (hashv-ref inc-exp-by-date cf-date) 0)
-                                               ie-conv)))))))))))
+                        (let loop-s ((rest splits) (va 0) (has-amt? #f) (ve 0))
+                          (if (null? rest)
+                              (when has-amt?
+                                (let* ((same-sign? (or (and (> va 0) (> ve 0))
+                                                       (and (< va 0) (< ve 0))))
+                                       (cf-raw (if (or (zero? ve) same-sign?) 0 (- ve)))
+                                       (ie-raw (if (zero? cf-raw) va (- va cf-raw)))
+                                       (conv-amt
+                                        (lambda (amt)
+                                          (let ((mon (gnc:make-gnc-monetary trans-curr amt)))
+                                            (gnc-numeric-convert
+                                             (gnc:gnc-monetary-amount
+                                              (exchange-fn mon report-currency cf-date))
+                                             (gnc-commodity-get-fraction report-currency)
+                                             GNC-RND-ROUND)))))
+                                  (when (not (zero? cf-raw))
+                                    (let ((cf-conv (conv-amt cf-raw)))
+                                      (hashv-set! cf-by-date cf-date
+                                                  (+ (or (hashv-ref cf-by-date cf-date) 0)
+                                                     cf-conv))))
+                                  (when (not (zero? ie-raw))
+                                    (let ((ie-conv (conv-amt ie-raw))
+                                          (target-tbl (if (> cf-raw 0)
+                                                          post-ie-by-date
+                                                          pre-ie-by-date)))
+                                      (hashv-set! target-tbl cf-date
+                                                  (+ (or (hashv-ref target-tbl cf-date) 0)
+                                                     ie-conv))))))
+                              (let* ((s (car rest))
+                                     (sa (xaccSplitGetAccount s)))
+                                (cond
+                                 ((null? sa)
+                                  (loop-s (cdr rest) va has-amt? ve))
+                                 ((hash-ref acct-set sa)
+                                  (if (zero? (xaccSplitGetAmount s))
+                                      (loop-s (cdr rest) va has-amt? ve)
+                                      (loop-s (cdr rest)
+                                              (+ va (xaccSplitGetValue s))
+                                              #t
+                                              ve)))
+                                 ((or (eqv? (xaccAccountGetType sa) ACCT-TYPE-TRADING)
+                                      (hash-ref return-acct-set sa))
+                                  (loop-s (cdr rest) va has-amt? ve))
+                                 (else
+                                  (loop-s (cdr rest) va has-amt?
+                                          (+ ve (xaccSplitGetValue s))))))))))))
                 (xaccAccountGetSplits acc)))
              account-set)
 
             (let* ((cf-dates (sort (hash-map->list (lambda (k v) k) cf-by-date) <))
                    (v-pre-by-date (make-hash-table))
+                   (pre-zero-by-date (make-hash-table))
                    (eval-dates (dedupe-sorted-numbers
                                 (sort (append dates-list cf-dates) <)))
                    (account-monetaries
@@ -614,6 +623,8 @@
                      account-set))
                    (date-collectors
                     (apply map gnc:monetaries-add account-monetaries))
+                   (zero-holdings-list
+                    (map gnc-commodity-collector-allzero? date-collectors))
                    (values-list
                     (map collector->report-currency-amount
                          date-collectors eval-dates)))
@@ -632,41 +643,77 @@
                               #:nosplit->elt (gnc:make-gnc-monetary comm 0))))
                          account-set))
                        (pre-collectors (apply map gnc:monetaries-add pre-monetaries))
+                       (pre-zeros (map gnc-commodity-collector-allzero? pre-collectors))
                        (pre-values (map collector->report-currency-amount
                                         pre-collectors cf-dates)))
-                  (for-each (cut hashv-set! v-pre-by-date <> <>) cf-dates pre-values)))
+                  (for-each (cut hashv-set! v-pre-by-date <> <>) cf-dates pre-values)
+                  (for-each (cut hashv-set! pre-zero-by-date <> <>) cf-dates pre-zeros)))
               (if (every zero? values-list)
                   #f
                   (let ((twr-by-date (make-hash-table)))
                     (hashv-set! twr-by-date (car eval-dates) 0.0)
                     (let loop ((dates (cdr eval-dates))
                                (vals (cdr values-list))
+                               (zero-holds (cdr zero-holdings-list))
                                (v-prev (exact->inexact (car values-list)))
                                (growth 1.0))
                       (unless (null? dates)
                         (let* ((d (car dates))
                                (v (exact->inexact (car vals)))
+                               (zero-hold? (car zero-holds))
                                (cf (exact->inexact (or (hashv-ref cf-by-date d) 0)))
-                               (r (if (zero? cf)
-                                      (if (and (> v-prev 0.0) (> v 0.0))
-                                          (- (/ v v-prev) 1.0)
-                                          0.0)
-                                      (if (> v-prev 0.0)
-                                          (let ((v-pre (exact->inexact
-                                                        (or (hashv-ref v-pre-by-date d) 0)))
-                                                (inc-exp (exact->inexact
-                                                          (or (hashv-ref inc-exp-by-date d) 0))))
-                                            (- (/ (+ v-pre inc-exp) v-prev) 1.0))
-                                          0.0)))
-                               (next-v-prev (cond
-                                             ((and (zero? cf) (> v-prev 0.0) (<= v 0.0))
-                                              v-prev)
-                                             ((and (not (zero? cf)) (<= v-prev 0.0))
-                                              (if (> cf 0.0) cf v))
-                                             (else v)))
-                               (new-growth (* growth (max 0.0 (+ 1.0 r)))))
+                               (pre-ie (exact->inexact (or (hashv-ref pre-ie-by-date d) 0)))
+                               (post-ie (exact->inexact (or (hashv-ref post-ie-by-date d) 0)))
+                               (v-pre (exact->inexact (or (hashv-ref v-pre-by-date d) 0)))
+                               (pre-zero? (hashv-ref pre-zero-by-date d))
+                               (factor
+                                (cond
+                                 ((zero? cf)
+                                  (cond
+                                   ((and (> v-prev 0.0) (> v 0.0)) (/ v v-prev))
+                                   ((and (> v-prev 0.0) (or zero-hold? (< v 0.0))) 0.0)
+                                   (else 1.0)))
+                                 ((and (> v-prev 0.0) zero-hold? (< cf 0.0))
+                                  (max 0.0 (/ (- cf) v-prev)))
+                                 ((> v-prev 0.0)
+                                  (if (and (<= (+ v-pre pre-ie) 0.0)
+                                           (> cf 0.0)
+                                           (> (+ v-pre cf pre-ie post-ie) 0.0))
+                                      (let ((f-pre (max 0.0 (/ v-pre v-prev)))
+                                            (base-post (+ v-pre cf)))
+                                        (* f-pre
+                                           (max 0.0
+                                                (/ (+ base-post pre-ie post-ie)
+                                                   base-post))))
+                                      (let* ((f-pre (max 0.0 (/ (+ v-pre pre-ie) v-prev)))
+                                             (base-post (+ v-pre pre-ie cf))
+                                             (f-post (if (and (not (zero? post-ie))
+                                                              (> base-post 0.0))
+                                                         (max 0.0 (/ (+ base-post post-ie)
+                                                                     base-post))
+                                                         1.0)))
+                                        (* f-pre f-post))))
+                                 ((and pre-zero? (> cf 0.0))
+                                  (let ((total-ie (+ pre-ie post-ie)))
+                                    (if (not (zero? total-ie))
+                                        (max 0.0 (/ (+ cf total-ie) cf))
+                                        1.0)))
+                                 ((and (not (zero? post-ie)) (> (+ v-pre cf) 0.0))
+                                  (let ((base-post (+ v-pre cf)))
+                                    (max 0.0 (/ (+ base-post post-ie) base-post))))
+                                 (else 1.0)))
+                               (next-v-prev
+                                (cond
+                                 ((and (zero? cf) (> v-prev 0.0) (= v 0.0) (not zero-hold?))
+                                  v-prev)
+                                 ((and (not (zero? cf)) (<= v-prev 0.0) pre-zero? (> cf 0.0))
+                                  (let ((basis (+ cf pre-ie post-ie)))
+                                    (if (> basis 0.0) basis v)))
+                                 (else v)))
+                               (new-growth (* growth (max 0.0 factor))))
                           (hashv-set! twr-by-date d (- new-growth 1.0))
-                          (loop (cdr dates) (cdr vals) next-v-prev new-growth))))
+                          (loop (cdr dates) (cdr vals) (cdr zero-holds)
+                                next-v-prev new-growth))))
                     (map (cut hashv-ref twr-by-date <>) dates-list))))))
 
         (define (count-accounts current-depth accts)
