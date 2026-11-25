@@ -60,10 +60,37 @@ gnc_add_test (test-assistant-stock-transaction
   test_assistant-stock-transaction_LIBS
 )
 
+set (test_price-updater_SOURCES
+  gtest-price-updater.cpp
+)
+
+set (test_price-updater_INCLUDE_DIRS
+  ${CMAKE_BINARY_DIR}/common
+  ${CMAKE_SOURCE_DIR}/libgnucash/engine
+  ${GNOME_UTILS_GUI_TEST_INCLUDE_DIRS}
+  ${CMAKE_SOURCE_DIR}/gnucash/gnome
+  ${GNOME_UTILS_GUI_TEST_LIBS}
+  ${GLIB2_INCLUDE_DIRS}
+)
+
+set (test_price-updater_LIBS
+  gnc-engine
+  gnc-gnome
+  gnc-gnome-utils
+  gtest
+)
+
+gnc_add_test (test-price-updater
+  "${test_price-updater_SOURCES}"
+  test_price-updater_INCLUDE_DIRS
+  test_price-updater_LIBS
+)
+
 set_dist_list(test_gnome_DIST
   CMakeLists.txt
   test-invoice-report-builtin-default.cpp
   ${test_gnome_scheme_SOURCES}
   ${test_gnome_SOURCES}
   ${test_assistant-stock-transaction_SOURCES}
+  ${test_price-updater_SOURCES}
 )

@@ -28,6 +28,7 @@ set (gnc_gnome_noinst_HEADERS
   dialog-order.h
   dialog-payment.h
   dialog-print-check.h
+  dialog-price-updater.h
   dialog-progress.h
   dialog-report-column-view.hpp
   dialog-report-style-sheet.h
@@ -95,6 +96,7 @@ set (gnc_gnome_SOURCES
   dialog-payment.c
   dialog-price-editor.c
   dialog-price-edit-db.cpp
+  dialog-price-updater.cpp
   dialog-print-check.c
   dialog-progress.c
   dialog-report-column-view.cpp

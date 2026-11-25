@@ -16,6 +16,14 @@
     </item>
   </menu>
 
+  <menu id="FilePlaceholder1">
+    <item>
+      <attribute name="label" translatable="yes">_Update Online Prices (Active Accounts)…</attribute>
+      <attribute name="action">gnc-plugin-basic-commands-actions.FileImportUpdatePricesAction</attribute>
+      <attribute name="tooltip" translatable="yes">Fetch and overwrite latest online prices for active accounts</attribute>
+    </item>
+  </menu>
+
   <menu id="FilePlaceholder2">
     <item>
       <attribute name="label" translatable="yes">_Save</attribute>

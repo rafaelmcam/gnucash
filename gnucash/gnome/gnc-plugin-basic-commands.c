@@ -46,6 +46,7 @@
 #include "dialog-fincalc.h"
 #include "dialog-find-transactions.h"
 #include "dialog-imap-editor.h"
+#include "dialog-price-updater.h"
 #include "dialog-sx-since-last-run.h"
 #include "dialog-totd.h"
 #include "assistant-acct-period.h"
@@ -75,6 +76,7 @@ static void gnc_main_window_cmd_file_save (GSimpleAction *simple, GVariant *para
 static void gnc_main_window_cmd_file_save_as (GSimpleAction *simple, GVariant *parameter, gpointer user_data);
 static void gnc_main_window_cmd_file_revert (GSimpleAction *simple, GVariant *parameter, gpointer user_data);
 static void gnc_main_window_cmd_file_export_accounts (GSimpleAction *simple, GVariant *parameter, gpointer user_data);
+static void gnc_main_window_cmd_file_import_update_prices (GSimpleAction *simple, GVariant *parameter, gpointer user_data);
 static void gnc_main_window_cmd_edit_tax_options (GSimpleAction *simple, GVariant *parameter, gpointer user_data);
 static void gnc_main_window_cmd_actions_mortgage_loan (GSimpleAction *simple, GVariant *parameter, gpointer user_data);
 static void gnc_main_window_cmd_actions_scheduled_transaction_editor (GSimpleAction *simple, GVariant *parameter, gpointer user_data);
@@ -108,6 +110,7 @@ static GActionEntry gnc_plugin_actions [] =
     { "FileSaveAsAction", gnc_main_window_cmd_file_save_as, NULL, NULL, NULL },
     { "FileRevertAction", gnc_main_window_cmd_file_revert, NULL, NULL, NULL },
     { "FileExportAccountsAction", gnc_main_window_cmd_file_export_accounts, NULL, NULL, NULL },
+    { "FileImportUpdatePricesAction", gnc_main_window_cmd_file_import_update_prices, NULL, NULL, NULL },
     { "EditFindTransactionsAction", gnc_main_window_cmd_tools_find_transactions, NULL, NULL, NULL },
     { "EditTaxOptionsAction", gnc_main_window_cmd_edit_tax_options, NULL, NULL, NULL },
     { "ActionsScheduledTransactionsAction", NULL, NULL, NULL, NULL },
@@ -133,6 +136,7 @@ static guint gnc_plugin_n_actions = G_N_ELEMENTS(gnc_plugin_actions);
 static const gchar *gnc_plugin_load_ui_items [] =
 {
     "FilePlaceholder0",
+    "FilePlaceholder1",
     "FilePlaceholder2",
     "FilePlaceholder3",
     "FilePlaceholder5",
@@ -158,6 +162,7 @@ static const gchar *gnc_plugin_initially_insensitive_actions[] =
  */
 static const gchar *readwrite_only_active_actions[] =
 {
+    "FileImportUpdatePricesAction",
     "ToolsBookCloseAction",
     NULL
 };
@@ -442,6 +447,18 @@ gnc_main_window_cmd_file_export_accounts (GSimpleAction *simple,
     gnc_file_export (GTK_WINDOW(data->window));
 #endif
     gnc_window_set_progressbar_window (NULL);
+}
+
+static void
+gnc_main_window_cmd_file_import_update_prices (GSimpleAction *simple,
+                                               GVariant      *parameter,
+                                               gpointer       user_data)
+{
+    GncMainWindowActionData *data = user_data;
+
+    g_return_if_fail (data != NULL);
+
+    gnc_update_active_prices_dialog (GTK_WINDOW(data->window));
 }
 
 static void

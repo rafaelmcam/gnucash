@@ -18,10 +18,15 @@ install(FILES ${templates_DATA}
 
 set(support_SCRIPTS
   benchmark-fetch.py
+  price-fetch.py
 )
 
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/benchmark-fetch.py
                ${CMAKE_BINARY_DIR}/${GUILE_REL_SITEDIR}/gnucash/reports/support/benchmark-fetch.py
+               COPYONLY)
+
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/price-fetch.py
+               ${CMAKE_BINARY_DIR}/${GUILE_REL_SITEDIR}/gnucash/reports/support/price-fetch.py
                COPYONLY)
 
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/benchmark-python.txt.in
