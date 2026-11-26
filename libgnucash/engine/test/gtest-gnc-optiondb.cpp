@@ -82,6 +82,26 @@ TEST_F(GncOptionDBTest, test_register_string_option)
     EXPECT_STREQ("waldo", m_db->lookup_string_option("foo", "bar").c_str());
 }
 
+TEST_F(GncOptionDBTest, test_register_account_allocation_option)
+{
+    gnc_register_account_allocation_option(
+        m_db, "Allocation", "Target Allocations", "a",
+        "Account allocation targets", std::string{""});
+    auto option{m_db->find_option("Allocation", "Target Allocations")};
+    ASSERT_NE(nullptr, option);
+    EXPECT_EQ(GncOptionUIType::ACCOUNT_ALLOCATION, option->get_ui_type());
+    EXPECT_TRUE(option->get_value<std::string>().empty());
+
+    std::string val{"guid1=60.00;guid2=40.00"};
+    option->set_value(val);
+    EXPECT_STREQ(val.c_str(),
+                 m_db->lookup_string_option("Allocation", "Target Allocations").c_str());
+    EXPECT_STREQ(val.c_str(), option->serialize().c_str());
+    option->deserialize("guid3=100.00");
+    EXPECT_STREQ("guid3=100.00",
+                 m_db->lookup_string_option("Allocation", "Target Allocations").c_str());
+}
+
 TEST_F(GncOptionDBTest, test_register_report_placement_option)
 {
     uint32_t report_id = 456;

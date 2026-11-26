@@ -786,6 +786,7 @@ wrap_unique_ptr(GncOptionDBPtr, GncOptionDB);
  */
 %ignore gnc_register_string_option(GncOptionDB*, const char* section, const char* name, const char* key, const char* doc_string, std::string value);
 %ignore gnc_register_text_option(GncOptionDB*, const char*, const char*, const char*, const char*, std::string);
+%ignore gnc_register_account_allocation_option(GncOptionDB*, const char*, const char*, const char*, const char*, std::string);
 %ignore gnc_register_font_option(GncOptionDB*, const char*, const char*, const char*, const char*, std::string);
 %ignore gnc_register_budget_option(GncOptionDB*, const char*, const char*, const char*, const char*, GncBudget*);
 %ignore gnc_register_commodity_option(GncOptionDB*, const char*, const char*, const char*, const char*, gnc_commodity*);

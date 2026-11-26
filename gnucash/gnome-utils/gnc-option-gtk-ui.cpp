@@ -24,8 +24,16 @@
 #include <gnc-option-impl.hpp>
 #include "gnc-option-gtk-ui.hpp"
 #include <config.h>  // for scanf format string
-#include <memory>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <iomanip>
+#include <locale>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
 #include <qof.h>
 #include <gnc-engine.h> // for GNC_MOD_GUI
 #include <gnc-commodity.h> // for GNC_COMMODITY
@@ -1932,6 +1940,566 @@ create_option_widget<GncOptionUIType::BUDGET> (GncOption& option,
     wrap_widget(option, widget, page_box, row);
 }
 
+namespace {
+
+enum AllocationColumns
+{
+    ALLOC_COL_GUID = 0,
+    ALLOC_COL_NAME,
+    ALLOC_COL_DIRECT_VAL,
+    ALLOC_COL_DIRECT_TEXT,
+    ALLOC_COL_SUBTREE_VAL,
+    ALLOC_COL_SUBTREE_TEXT,
+    ALLOC_COL_WEIGHT,
+    NUM_ALLOC_COLS
+};
+
+std::string
+account_guid_str(const Account* acc)
+{
+    char guid_buf[GUID_ENCODING_LENGTH + 1];
+    guid_to_string_buff(xaccAccountGetGUID(acc), guid_buf);
+    return std::string{guid_buf};
+}
+
+std::map<std::string, double>
+parse_allocation_string(const std::string& raw)
+{
+    std::map<std::string, double> result;
+    std::istringstream iss{raw};
+    std::string token;
+    while (std::getline(iss, token, ';'))
+    {
+        auto eq_pos = token.find('=');
+        if (eq_pos == std::string::npos || eq_pos == 0)
+            continue;
+        std::string guid = token.substr(0, eq_pos);
+        std::string val_str = token.substr(eq_pos + 1);
+        if (val_str.empty())
+            continue;
+        char* endptr = nullptr;
+        double val = g_ascii_strtod(val_str.c_str(), &endptr);
+        if (endptr && *endptr == '\0' && std::isfinite(val) && val > 1e-6)
+            result[guid] = val;
+    }
+    return result;
+}
+
+std::string
+format_allocation_number(double val)
+{
+    std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    double rounded4 = std::round(val * 10000.0) / 10000.0;
+    double rounded2 = std::round(val * 100.0) / 100.0;
+    if (std::fabs(rounded4 - rounded2) > 1e-4)
+    {
+        oss << std::fixed << std::setprecision(4) << rounded4;
+        std::string s = oss.str();
+        while (s.size() > 1 && s.back() == '0')
+            s.pop_back();
+        if (!s.empty() && s.back() == '.')
+            s.pop_back();
+        return s;
+    }
+    oss << std::fixed << std::setprecision(2) << rounded2;
+    return oss.str();
+}
+
+std::string
+serialize_allocation_map(const std::map<std::string, double>& allocs)
+{
+    std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    bool first = true;
+    for (const auto& [guid, val] : allocs)
+    {
+        if (val <= 1e-6)
+            continue;
+        if (!first)
+            oss << ';';
+        first = false;
+        oss << guid << '=' << format_allocation_number(val);
+    }
+    return oss.str();
+}
+
+bool
+parse_user_percentage(const char* text, double& out_val)
+{
+    if (!text)
+    {
+        out_val = 0.0;
+        return true;
+    }
+    std::string s{text};
+    auto first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        out_val = 0.0;
+        return true;
+    }
+    auto last = s.find_last_not_of(" \t\r\n%");
+    if (last == std::string::npos || last < first)
+    {
+        out_val = 0.0;
+        return true;
+    }
+    s = s.substr(first, last - first + 1);
+    std::replace(s.begin(), s.end(), ',', '.');
+    char* endptr = nullptr;
+    double val = g_ascii_strtod(s.c_str(), &endptr);
+    if (!endptr || *endptr != '\0' || !std::isfinite(val))
+        return false;
+    if (val < 0.0 || val > 100.0)
+        return false;
+    out_val = val;
+    return true;
+}
+
+std::string
+format_pct_edit(double val)
+{
+    if (val <= 1e-6)
+        return {};
+    return format_allocation_number(val);
+}
+
+std::string
+format_pct_display(double val)
+{
+    if (val <= 1e-6)
+        return {};
+    return format_allocation_number(val) + "%";
+}
+
+bool
+is_allocation_account_type(GNCAccountType type)
+{
+    switch (type)
+    {
+        case ACCT_TYPE_ASSET:
+        case ACCT_TYPE_BANK:
+        case ACCT_TYPE_CASH:
+        case ACCT_TYPE_STOCK:
+        case ACCT_TYPE_MUTUAL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool
+account_should_show(Account* acc, bool show_hidden,
+                    const std::map<std::string, double>& allocs)
+{
+    if (!acc)
+        return false;
+    const bool is_hidden = xaccAccountGetHidden(acc);
+    auto it = allocs.find(account_guid_str(acc));
+    const bool has_direct_alloc = (it != allocs.end() && it->second > 1e-6);
+
+    bool child_visible = false;
+    GList* children = gnc_account_get_children_sorted(acc);
+    for (GList* n = children; n; n = n->next)
+    {
+        if (account_should_show(static_cast<Account*>(n->data), show_hidden, allocs))
+        {
+            child_visible = true;
+            break;
+        }
+    }
+    g_list_free(children);
+
+    if (has_direct_alloc || child_visible)
+        return true;
+    if (is_hidden && !show_hidden)
+        return false;
+    return is_allocation_account_type(xaccAccountGetType(acc));
+}
+
+} // namespace
+
+class GncGtkAccountAllocationUIItem : public GncOptionGtkUIItem
+{
+public:
+    GncGtkAccountAllocationUIItem(GtkWidget* tree_view, GtkTreeStore* store,
+                                  GtkLabel* status_label,
+                                  GtkToggleButton* show_hidden) :
+        GncOptionGtkUIItem{tree_view, GncOptionUIType::ACCOUNT_ALLOCATION},
+        m_store{store},
+        m_status_label{status_label},
+        m_show_hidden{show_hidden} {}
+
+    void set_ui_item_from_option(GncOption& option) noexcept override
+    {
+        m_allocations = parse_allocation_string(option.get_value<std::string>());
+        populate_tree();
+    }
+
+    void set_option_from_ui_item(GncOption& option) noexcept override
+    {
+        option.set_value(serialize_allocation_map(m_allocations));
+    }
+
+    void on_direct_cell_edited(const gchar* path_str, const gchar* new_text,
+                               GncOption* option)
+    {
+        GtkTreeIter iter;
+        auto model = GTK_TREE_MODEL(m_store);
+        if (!gtk_tree_model_get_iter_from_string(model, &iter, path_str))
+            return;
+
+        double val = 0.0;
+        if (!parse_user_percentage(new_text, val))
+            return;
+
+        gchar* guid = nullptr;
+        gtk_tree_model_get(model, &iter, ALLOC_COL_GUID, &guid, -1);
+        if (!guid)
+            return;
+
+        if (val > 1e-6)
+            m_allocations[guid] = val;
+        else
+            m_allocations.erase(guid);
+        g_free(guid);
+
+        auto edit_text = format_pct_edit(val);
+        gtk_tree_store_set(m_store, &iter,
+                           ALLOC_COL_DIRECT_VAL, val,
+                           ALLOC_COL_DIRECT_TEXT, edit_text.c_str(),
+                           -1);
+        recompute_totals();
+        gnc_option_changed_widget_cb(get_widget(), option);
+    }
+
+    void on_clear_all(GncOption* option)
+    {
+        m_allocations.clear();
+        populate_tree();
+        gnc_option_changed_widget_cb(get_widget(), option);
+    }
+
+    void on_show_hidden_toggled()
+    {
+        populate_tree();
+    }
+
+private:
+    double recompute_subtree(GtkTreeIter* iter)
+    {
+        auto model = GTK_TREE_MODEL(m_store);
+        double direct = 0.0;
+        gtk_tree_model_get(model, iter, ALLOC_COL_DIRECT_VAL, &direct, -1);
+
+        double children_sum = 0.0;
+        GtkTreeIter child;
+        bool has_children = gtk_tree_model_iter_children(model, &child, iter);
+        if (has_children)
+        {
+            do
+            {
+                children_sum += recompute_subtree(&child);
+            } while (gtk_tree_model_iter_next(model, &child));
+        }
+
+        double subtree = direct + children_sum;
+        auto subtree_text = format_pct_display(subtree);
+        int weight = (has_children && subtree > 1e-6)
+                         ? PANGO_WEIGHT_BOLD
+                         : PANGO_WEIGHT_NORMAL;
+
+        gtk_tree_store_set(m_store, iter,
+                           ALLOC_COL_SUBTREE_VAL, subtree,
+                           ALLOC_COL_SUBTREE_TEXT, subtree_text.c_str(),
+                           ALLOC_COL_WEIGHT, weight,
+                           -1);
+        return subtree;
+    }
+
+    void recompute_totals()
+    {
+        auto model = GTK_TREE_MODEL(m_store);
+        GtkTreeIter root_iter;
+        if (gtk_tree_model_get_iter_first(model, &root_iter))
+        {
+            do
+            {
+                recompute_subtree(&root_iter);
+            } while (gtk_tree_model_iter_next(model, &root_iter));
+        }
+
+        double total = 0.0;
+        for (const auto& [guid, val] : m_allocations)
+            total += val;
+
+        std::string total_str = format_allocation_number(total);
+        gchar* markup = nullptr;
+        if (std::fabs(total - 100.0) <= 0.01)
+        {
+            markup = g_strdup_printf(
+                "<span foreground='#1b7a2e'><b>%s: %s%% ✓</b></span>",
+                _("Total Direct Allocation"), total_str.c_str());
+        }
+        else if (total < 100.0)
+        {
+            std::string rem_str = format_allocation_number(100.0 - total);
+            markup = g_strdup_printf(
+                "<span foreground='#c0392b'><b>%s: %s%% (%s%% %s — %s)</b></span>",
+                _("Total Direct Allocation"), total_str.c_str(),
+                rem_str.c_str(), _("remaining"), _("must equal 100%"));
+        }
+        else
+        {
+            std::string over_str = format_allocation_number(total - 100.0);
+            markup = g_strdup_printf(
+                "<span foreground='#c0392b'><b>%s: %s%% (%s%% %s — %s)</b></span>",
+                _("Total Direct Allocation"), total_str.c_str(),
+                over_str.c_str(), _("over"), _("must equal 100%"));
+        }
+        gtk_label_set_markup(m_status_label, markup);
+        g_free(markup);
+    }
+
+    void append_account_subtree(Account* acc, GtkTreeIter* parent_iter,
+                                bool show_hidden)
+    {
+        if (!account_should_show(acc, show_hidden, m_allocations))
+            return;
+
+        std::string guid = account_guid_str(acc);
+        double direct = 0.0;
+        if (auto it = m_allocations.find(guid); it != m_allocations.end())
+            direct = it->second;
+
+        const char* name = xaccAccountGetName(acc);
+        auto direct_text = format_pct_edit(direct);
+
+        GtkTreeIter iter;
+        gtk_tree_store_append(m_store, &iter, parent_iter);
+        gtk_tree_store_set(m_store, &iter,
+                           ALLOC_COL_GUID, guid.c_str(),
+                           ALLOC_COL_NAME, name ? name : "",
+                           ALLOC_COL_DIRECT_VAL, direct,
+                           ALLOC_COL_DIRECT_TEXT, direct_text.c_str(),
+                           ALLOC_COL_SUBTREE_VAL, 0.0,
+                           ALLOC_COL_SUBTREE_TEXT, "",
+                           ALLOC_COL_WEIGHT, PANGO_WEIGHT_NORMAL,
+                           -1);
+
+        GList* children = gnc_account_get_children_sorted(acc);
+        for (GList* n = children; n; n = n->next)
+            append_account_subtree(static_cast<Account*>(n->data), &iter,
+                                   show_hidden);
+        g_list_free(children);
+    }
+
+    void populate_tree()
+    {
+        gtk_tree_store_clear(m_store);
+        const bool show_hidden =
+            m_show_hidden ? gtk_toggle_button_get_active(m_show_hidden) : false;
+        auto root = gnc_get_current_root_account();
+        if (root)
+        {
+            GList* top_accounts = gnc_account_get_children_sorted(root);
+            for (GList* n = top_accounts; n; n = n->next)
+                append_account_subtree(static_cast<Account*>(n->data),
+                                       nullptr, show_hidden);
+            g_list_free(top_accounts);
+        }
+        recompute_totals();
+        gtk_tree_view_expand_all(GTK_TREE_VIEW(get_widget()));
+    }
+
+    GtkTreeStore* m_store;
+    GtkLabel* m_status_label;
+    GtkToggleButton* m_show_hidden;
+    std::map<std::string, double> m_allocations;
+};
+
+static void
+allocation_direct_cell_edited_cb(GtkCellRendererText* cell, gchar* path_str,
+                                 gchar* new_text, gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkAccountAllocationUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_direct_cell_edited(path_str, new_text, option);
+}
+
+static void
+allocation_clear_all_cb(GtkButton* button, gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkAccountAllocationUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_clear_all(option);
+}
+
+static void
+allocation_expand_all_cb(GtkButton* button, gpointer data)
+{
+    auto tree_view = GTK_TREE_VIEW(data);
+    if (tree_view)
+        gtk_tree_view_expand_all(tree_view);
+}
+
+static void
+allocation_collapse_all_cb(GtkButton* button, gpointer data)
+{
+    auto tree_view = GTK_TREE_VIEW(data);
+    if (tree_view)
+        gtk_tree_view_collapse_all(tree_view);
+}
+
+static void
+allocation_show_hidden_toggled_cb(GtkToggleButton* button, gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkAccountAllocationUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_show_hidden_toggled();
+}
+
+template<> void
+create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>(GncOption& option,
+                                                          GtkGrid *page_box,
+                                                          int row)
+{
+    auto store = gtk_tree_store_new(NUM_ALLOC_COLS,
+                                    G_TYPE_STRING,
+                                    G_TYPE_STRING,
+                                    G_TYPE_DOUBLE,
+                                    G_TYPE_STRING,
+                                    G_TYPE_DOUBLE,
+                                    G_TYPE_STRING,
+                                    G_TYPE_INT);
+    auto tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+    g_object_unref(store);
+
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree_view), TRUE);
+    gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(tree_view), TRUE);
+
+    /* Column 0: Account hierarchy */
+    auto acct_renderer = gtk_cell_renderer_text_new();
+    auto acct_col = gtk_tree_view_column_new_with_attributes(
+        _("Account"), acct_renderer,
+        "text", ALLOC_COL_NAME,
+        "weight", ALLOC_COL_WEIGHT,
+        nullptr);
+    gtk_tree_view_column_set_expand(acct_col, TRUE);
+    gtk_tree_view_column_set_resizable(acct_col, TRUE);
+    gtk_tree_view_column_set_min_width(acct_col, 320);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), acct_col);
+
+    /* Column 1: Direct Target (%) editable cell */
+    auto direct_renderer = gtk_cell_renderer_text_new();
+    g_object_set(G_OBJECT(direct_renderer),
+                 "editable", TRUE,
+                 "xalign", 1.0,
+                 nullptr);
+    g_signal_connect(G_OBJECT(direct_renderer), "edited",
+                     G_CALLBACK(allocation_direct_cell_edited_cb), &option);
+    auto direct_col = gtk_tree_view_column_new_with_attributes(
+        _("Direct Target (%)"), direct_renderer,
+        "text", ALLOC_COL_DIRECT_TEXT,
+        nullptr);
+    gtk_tree_view_column_set_alignment(direct_col, 1.0);
+    gtk_tree_view_column_set_min_width(direct_col, 140);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), direct_col);
+
+    /* Column 2: Effective Subtree Total (%) read-only cell */
+    auto subtree_renderer = gtk_cell_renderer_text_new();
+    g_object_set(G_OBJECT(subtree_renderer), "xalign", 1.0, nullptr);
+    auto subtree_col = gtk_tree_view_column_new_with_attributes(
+        _("Effective Total (%)"), subtree_renderer,
+        "text", ALLOC_COL_SUBTREE_TEXT,
+        "weight", ALLOC_COL_WEIGHT,
+        nullptr);
+    gtk_tree_view_column_set_alignment(subtree_col, 1.0);
+    gtk_tree_view_column_set_min_width(subtree_col, 140);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), subtree_col);
+
+    auto frame = gtk_frame_new(_(option.get_name().c_str()));
+    gtk_widget_set_hexpand(frame, TRUE);
+    gtk_widget_set_vexpand(frame, TRUE);
+
+    auto vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 6);
+    gtk_container_add(GTK_CONTAINER(frame), vbox);
+
+    auto help_label = gtk_label_new(
+        _("Click a cell in \"Direct Target (%)\" to enter an account's direct allocation percentage (press Enter to confirm). Parent effective totals roll up automatically from subaccounts. Direct targets must sum to 100%."));
+    gtk_label_set_line_wrap(GTK_LABEL(help_label), TRUE);
+    gtk_widget_set_halign(help_label, GTK_ALIGN_START);
+    gtk_label_set_xalign(GTK_LABEL(help_label), 0.0);
+    gtk_box_pack_start(GTK_BOX(vbox), help_label, FALSE, FALSE, 0);
+
+    auto scroll_win = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_win),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(scroll_win),
+                                        GTK_SHADOW_IN);
+    gtk_widget_set_size_request(scroll_win, 700, 420);
+    gtk_widget_set_hexpand(scroll_win, TRUE);
+    gtk_widget_set_vexpand(scroll_win, TRUE);
+    gtk_container_add(GTK_CONTAINER(scroll_win), tree_view);
+    gtk_box_pack_start(GTK_BOX(vbox), scroll_win, TRUE, TRUE, 0);
+
+    auto status_label = gtk_label_new("");
+    gtk_widget_set_halign(status_label, GTK_ALIGN_START);
+    gtk_label_set_xalign(GTK_LABEL(status_label), 0.0);
+
+    auto show_hidden_btn =
+        gtk_check_button_new_with_label(_("Show Hidden Accounts"));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(show_hidden_btn), FALSE);
+
+    auto expand_btn = gtk_button_new_with_label(_("Expand All"));
+    auto collapse_btn = gtk_button_new_with_label(_("Collapse All"));
+    auto clear_btn = gtk_button_new_with_label(_("Clear All"));
+
+    auto controls_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(controls_box), status_label, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(controls_box), clear_btn, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(controls_box), collapse_btn, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(controls_box), expand_btn, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(controls_box), show_hidden_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), controls_box, FALSE, FALSE, 0);
+
+    option.set_ui_item(std::make_unique<GncGtkAccountAllocationUIItem>(
+        tree_view, store, GTK_LABEL(status_label),
+        GTK_TOGGLE_BUTTON(show_hidden_btn)));
+    option.set_ui_item_from_option();
+
+    g_signal_connect(G_OBJECT(show_hidden_btn), "toggled",
+                     G_CALLBACK(allocation_show_hidden_toggled_cb), &option);
+    g_signal_connect(G_OBJECT(expand_btn), "clicked",
+                     G_CALLBACK(allocation_expand_all_cb), tree_view);
+    g_signal_connect(G_OBJECT(collapse_btn), "clicked",
+                     G_CALLBACK(allocation_collapse_all_cb), tree_view);
+    g_signal_connect(G_OBJECT(clear_btn), "clicked",
+                     G_CALLBACK(allocation_clear_all_cb), &option);
+
+    set_tool_tip(option, frame);
+    gtk_widget_set_halign(GTK_WIDGET(page_box), GTK_ALIGN_FILL);
+    gtk_widget_set_hexpand(GTK_WIDGET(page_box), TRUE);
+    gtk_widget_set_vexpand(GTK_WIDGET(page_box), TRUE);
+    gtk_widget_show_all(frame);
+    gtk_grid_attach(GTK_GRID(page_box), frame, 0, row, 2, 1);
+}
+
 static void
 gnc_options_ui_factory_initialize(void)
 {
@@ -1975,6 +2543,8 @@ gnc_options_ui_factory_initialize(void)
                                  create_option_widget<GncOptionUIType::RADIOBUTTON>);
     GncOptionUIFactory::set_func(GncOptionUIType::DATE_FORMAT,
                                  create_option_widget<GncOptionUIType::DATE_FORMAT>);
+    GncOptionUIFactory::set_func(GncOptionUIType::ACCOUNT_ALLOCATION,
+                                 create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>);
 
 
 }

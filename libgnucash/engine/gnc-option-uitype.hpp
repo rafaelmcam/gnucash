@@ -69,6 +69,7 @@ enum class GncOptionUIType : unsigned int
     INV_REPORT,
     QUERY,
     REPORT_PLACEMENT,
+    ACCOUNT_ALLOCATION,
     MAX_VALUE,  //Nake sure this one is always last
 };
 

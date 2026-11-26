@@ -19,6 +19,7 @@ set (reports_standard_SCHEME
     standard/account-piecharts.scm
     standard/account-summary.scm
     standard/advanced-portfolio.scm
+    standard/asset-allocation.scm
     standard/balance-sheet.scm
     standard/balance-forecast.scm
     standard/balsheet-pnl.scm

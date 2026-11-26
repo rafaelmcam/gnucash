@@ -644,6 +644,17 @@ gnc_register_text_option(GncOptionDB* db, const char* section, const char* name,
 }
 
 void
+gnc_register_account_allocation_option(GncOptionDB* db, const char* section,
+                                       const char* name, const char* key,
+                                       const char* doc_string,
+                                       std::string value)
+{
+    GncOption option{section, name, key, doc_string, std::move(value),
+                     GncOptionUIType::ACCOUNT_ALLOCATION};
+    db->register_option(section, std::move(option));
+}
+
+void
 gnc_register_font_option(GncOptionDB* db, const char* section,
                          const char* name, const char* key,
                          const char* doc_string, std::string value)
