@@ -55,6 +55,9 @@
 (define optname-show-bar-chart (N_ "Show current allocation bar chart"))
 (define optname-show-time-chart (N_ "Show allocation over time chart"))
 (define optname-show-table (N_ "Show table"))
+(define optname-chart-filter-mode (N_ "Chart Account Filter"))
+(define optname-chart-top-n (N_ "Maximum Accounts in Charts"))
+(define optname-chart-min-pct (N_ "Minimum Allocation in Charts (%)"))
 (define optname-plot-width (N_ "Plot Width"))
 (define optname-plot-height (N_ "Plot Height"))
 (define optname-line-width (N_ "Line Width"))
@@ -93,7 +96,7 @@
 
     (gnc:options-add-account-levels!
      options pagename-allocation optname-levels "b"
-     (N_ "Maximum number of levels in the account tree displayed.")
+     (N_ "Maximum number of levels in the account tree displayed in charts (the table always shows all accounts).")
      'all)
 
     ;; General tab
@@ -127,6 +130,30 @@
     (gnc-register-simple-boolean-option options
       gnc:pagename-display optname-show-table
       "d" (N_ "Display a summary rebalancing table?") #t)
+
+    (gnc-register-multichoice-callback-option options
+      gnc:pagename-display optname-chart-filter-mode
+      "d1" (N_ "Choose which target accounts are shown in both the bar chart and the over-time chart (the table always shows all accounts).")
+      "top-n"
+      (list
+       (vector 'top-n (G_ "Top N largest allocations"))
+       (vector 'min-pct (G_ "Allocations >= minimum %"))
+       (vector 'all (G_ "All target accounts")))
+      (lambda (x)
+        (gnc-optiondb-set-option-selectable-by-name
+         options gnc:pagename-display optname-chart-top-n (eq? x 'top-n))
+        (gnc-optiondb-set-option-selectable-by-name
+         options gnc:pagename-display optname-chart-min-pct (eq? x 'min-pct))))
+
+    (gnc-register-number-range-option options
+      gnc:pagename-display optname-chart-top-n
+      "d2" (N_ "Maximum number of largest-allocation accounts to display in charts.")
+      6 1 50 1)
+
+    (gnc-register-number-range-option options
+      gnc:pagename-display optname-chart-min-pct
+      "d3" (N_ "Minimum target or actual allocation percentage required for an account to appear in charts.")
+      5.0 0.0 100.0 0.5)
 
     (gnc:options-add-plot-size!
      options gnc:pagename-display
@@ -277,6 +304,9 @@
          (show-bar-chart? (get-option gnc:pagename-display optname-show-bar-chart))
          (show-time-chart? (get-option gnc:pagename-display optname-show-time-chart))
          (show-table? (get-option gnc:pagename-display optname-show-table))
+         (chart-filter-mode (get-option gnc:pagename-display optname-chart-filter-mode))
+         (chart-top-n (get-option gnc:pagename-display optname-chart-top-n))
+         (chart-min-pct (get-option gnc:pagename-display optname-chart-min-pct))
          (height (get-option gnc:pagename-display optname-plot-height))
          (width (get-option gnc:pagename-display optname-plot-width))
          (line-width (get-option gnc:pagename-display optname-line-width))
@@ -336,16 +366,7 @@
 
          (else
           (let* ((all-nodes (build-allocation-tree root acct->direct))
-                 (table-nodes (filter (lambda (n) (<= (node-depth n) tree-depth))
-                                      all-nodes))
-                 (chart-nodes-filtered
-                  (filter (lambda (n)
-                            (not (and (<= (node-direct n) 1e-6)
-                                      (>= (node-effective n) 99.99))))
-                          table-nodes))
-                 (chart-nodes (if (null? chart-nodes-filtered)
-                                  table-nodes
-                                  chart-nodes-filtered))
+                 (table-nodes all-nodes)
                  (all-universe-accts
                   (delete-duplicates
                    (append-map node-universe-accts all-nodes)
@@ -428,223 +449,294 @@
                   report-title (gnc:report-id report-obj))))
 
                (else
-                ;; 1. Bar chart: Target vs Actual & Difference in report currency
-                (when show-bar-chart?
-                  (let ((bar-chart (gnc:make-html-chart)))
-                    (gnc:html-chart-set-type! bar-chart 'bar)
-                    (gnc:html-chart-set-stacking?! bar-chart #f)
-                    (gnc:html-chart-set-title!
-                     bar-chart
-                     (list (format #f (G_ "~a — Target vs Actual (~a)")
-                                   report-title (qof-print-date (last dates-list)))))
-                    (gnc:html-chart-set-width! bar-chart width)
-                    (gnc:html-chart-set-height! bar-chart height)
-                    (gnc:html-chart-set-format-style! bar-chart "currency")
-                    (gnc:html-chart-set-currency-iso!
-                     bar-chart (gnc-commodity-get-mnemonic report-currency))
-                    (gnc:html-chart-set-currency-symbol!
-                     bar-chart (gnc-commodity-get-nice-symbol report-currency))
-                    (gnc:html-chart-set-y-axis-label!
-                     bar-chart (gnc-commodity-get-mnemonic report-currency))
-                    (gnc:html-chart-set!
-                     bar-chart '(options scales yAxes (0) ticks beginAtZero) #t)
-                    (gnc:html-chart-set-grid?! bar-chart y-grid)
-                    (gnc:html-chart-set-tooltip-mode! bar-chart 'index)
-                    (gnc:html-chart-set-tooltip-non-zero-only! bar-chart #f)
-                    (gnc:html-chart-set-data-labels!
-                     bar-chart
-                     (map (lambda (n)
-                            (format #f "~a (~,1f% vs ~,1f%, ~a)"
-                                    (acct->name (node-acct n))
-                                    (node-actual-pct n)
-                                    (node-effective n)
-                                    (format-signed-pct (node-diff-pct-pts n) 1)))
-                          chart-nodes))
-                    (gnc:html-chart-add-data-series!
-                     bar-chart (G_ "Target")
-                     (map node-target-val chart-nodes)
-                     "#0074D9"
-                     'fill #t
-                     'borderWidth 1)
-                    (gnc:html-chart-add-data-series!
-                     bar-chart (G_ "Actual")
-                     (map node-actual-val chart-nodes)
-                     "#2E8B57"
-                     'fill #t
-                     'borderWidth 1)
-                    (gnc:html-chart-add-data-series!
-                     bar-chart (G_ "Difference (Actual - Target)")
-                     (map node-diff-val chart-nodes)
-                     (map (lambda (n)
-                            (if (>= (node-diff-val n) 0.0) "#2ECC40" "#FF4136"))
-                          chart-nodes)
-                     'fill #t
-                     'borderWidth 1)
-                    (gnc:html-document-add-object! document bar-chart)))
+                (let* ((depth-nodes
+                        (filter (lambda (n) (<= (node-depth n) tree-depth))
+                                all-nodes))
+                       (chart-candidates-raw
+                        (filter (lambda (n)
+                                  (not (and (<= (node-direct n) 1e-6)
+                                            (>= (node-effective n) 99.99))))
+                                depth-nodes))
+                       (chart-candidates
+                        (if (null? chart-candidates-raw)
+                            depth-nodes
+                            chart-candidates-raw))
+                       (node-chart-score
+                        (lambda (n)
+                          (max (node-effective n) (node-actual-pct n))))
+                       (sorted-candidates
+                        (stable-sort
+                         chart-candidates
+                         (lambda (a b)
+                           (let ((sa (node-chart-score a))
+                                 (sb (node-chart-score b)))
+                             (if (> (abs (- sa sb)) 1e-6)
+                                 (> sa sb)
+                                 (> (node-effective a) (node-effective b)))))))
+                       (chart-nodes
+                        (case chart-filter-mode
+                          ((top-n)
+                           (let ((n-lim (max 1 (inexact->exact (round chart-top-n)))))
+                             (take sorted-candidates
+                                   (min n-lim (length sorted-candidates)))))
+                          ((min-pct)
+                           (filter (lambda (n)
+                                     (>= (node-chart-score n)
+                                         (- chart-min-pct 1e-6)))
+                                   sorted-candidates))
+                          (else sorted-candidates)))
+                       (filter-subtitle
+                        (and (< (length chart-nodes) (length chart-candidates))
+                             (case chart-filter-mode
+                               ((top-n)
+                                (format #f
+                                        (G_ "Showing top ~a of ~a allocations")
+                                        (length chart-nodes)
+                                        (length chart-candidates)))
+                               ((min-pct)
+                                (format #f
+                                        (G_ "Showing ~a of ~a allocations (>= ~,1f%)")
+                                        (length chart-nodes)
+                                        (length chart-candidates)
+                                        chart-min-pct))
+                               (else #f)))))
 
-                ;; 2. Detailed rebalancing table
-                (when show-table?
-                  (let* ((table (gnc:make-html-table))
-                         (min-depth (apply min (map node-depth table-nodes))))
-                    (gnc:html-table-set-style!
-                     table "table"
-                     'attribute (list "border" 0)
-                     'attribute (list "cellspacing" 0)
-                     'attribute (list "cellpadding" 4))
-                    (gnc:html-table-set-col-headers!
-                     table
-                     (list (G_ "Account")
-                           (G_ "Direct Target")
-                           (G_ "Effective Target")
-                           (G_ "Target Value")
-                           (G_ "Actual Value")
-                           (G_ "Actual %")
-                           (G_ "Difference")
-                           (G_ "Diff (% pts)")
-                           (G_ "Diff vs Target")))
-                    (for-each
-                     (lambda (n)
-                       (let* ((indent-levels (max 0 (- (node-depth n) min-depth)))
-                              (indent-str (string-concatenate
-                                           (make-list (* 3 indent-levels) "&#160;")))
-                              (name-cell (string-append indent-str
-                                                        (acct->name (node-acct n))))
-                              (direct-str (if (> (node-direct n) 1e-6)
-                                              (format #f "~,2f%" (node-direct n))
-                                              "—"))
-                              (eff-str (format #f "~,2f%" (node-effective n)))
-                              (diff-val (node-diff-val n))
-                              (diff-cell (gnc:make-html-table-cell/markup
-                                          "number-cell"
-                                          (format-signed-currency
-                                           report-currency diff-val))))
-                         (gnc:html-table-append-row!
-                          table
-                          (list name-cell
-                                (gnc:make-html-table-cell/markup "number-cell" direct-str)
-                                (gnc:make-html-table-cell/markup "number-cell" eff-str)
-                                (gnc:make-html-table-cell/markup
-                                 "number-cell"
-                                 (float->monetary report-currency (node-target-val n)))
-                                (gnc:make-html-table-cell/markup
-                                 "number-cell"
-                                 (float->monetary report-currency (node-actual-val n)))
-                                (gnc:make-html-table-cell/markup
-                                 "number-cell"
-                                 (format #f "~,2f%" (node-actual-pct n)))
-                                diff-cell
-                                (gnc:make-html-table-cell/markup
-                                 "number-cell"
-                                 (format-signed-pct (node-diff-pct-pts n) 2))
-                                (gnc:make-html-table-cell/markup
-                                 "number-cell"
-                                 (format-signed-pct (node-rel-diff-pct n) 2))))))
-                     table-nodes)
-                    (gnc:html-table-append-row/markup!
-                     table "grand-total"
-                     (list (gnc:make-html-table-cell/markup "total-label-cell"
-                                                            (G_ "Total Portfolio"))
-                           (gnc:make-html-table-cell/markup "total-number-cell"
-                                                            (format #f "~,2f%" total-direct))
-                           (gnc:make-html-table-cell/markup "total-number-cell" "100.00%")
-                           (gnc:make-html-table-cell/markup
-                            "total-number-cell"
-                            (float->monetary report-currency total-end-val))
-                           (gnc:make-html-table-cell/markup
-                            "total-number-cell"
-                            (float->monetary report-currency total-end-val))
-                           (gnc:make-html-table-cell/markup "total-number-cell" "100.00%")
-                           (gnc:make-html-table-cell/markup
-                            "total-number-cell"
-                            (float->monetary report-currency 0.0))
-                           (gnc:make-html-table-cell/markup "total-number-cell" "0.00%")
-                           (gnc:make-html-table-cell/markup "total-number-cell" "0.00%")))
-                    (gnc:html-document-add-object! document table)))
+                  ;; Empty chart selection notice when min-% threshold excludes all accounts
+                  (when (and (null? chart-nodes)
+                             (or show-bar-chart? show-time-chart?))
+                    (gnc:html-document-add-object!
+                     document
+                     (gnc:make-html-text
+                      (gnc:html-markup/attr
+                       "p"
+                       "style='margin:8px 0;padding:8px 12px;background:#fff8e1;border:1px solid #ffe082;border-radius:4px;'"
+                       (format #f
+                               (G_ "No accounts meet the chart filter threshold (>= ~,1f%). All target accounts are listed in the table below.")
+                               chart-min-pct)))))
 
-                ;; 3. Over-time line chart: solid Actual % vs dashed Target % with matching color
-                (when show-time-chart?
-                  (let ((line-chart (gnc:make-html-chart))
-                        (colors (gnc:assign-colors (length chart-nodes))))
-                    (gnc:html-chart-set-type! line-chart 'line)
-                    (gnc:html-chart-set-title!
-                     line-chart
-                     (list (format #f (G_ "~a — Allocation Over Time") report-title)
-                           (gnc-date-interval-format from-date-t64 to-date-t64)))
-                    (gnc:html-chart-set-width! line-chart width)
-                    (gnc:html-chart-set-height! line-chart height)
-                    (gnc:html-chart-set-format-style! line-chart "percent")
-                    (gnc:html-chart-set-currency-iso!
-                     line-chart (gnc-commodity-get-mnemonic report-currency))
-                    (gnc:html-chart-set-currency-symbol!
-                     line-chart (gnc-commodity-get-nice-symbol report-currency))
-                    (gnc:html-chart-set-y-axis-label! line-chart (G_ "Allocation (%)"))
-                    (gnc:html-chart-set!
-                     line-chart '(options scales yAxes (0) ticks beginAtZero) #t)
-                    (gnc:html-chart-set-data-labels! line-chart date-string-list)
-                    (gnc:html-chart-set-grid?! line-chart y-grid)
-                    (gnc:html-chart-set-tooltip-mode! line-chart 'index)
-                    (gnc:html-chart-set-tooltip-non-zero-only! line-chart #f)
+                  ;; 1. Bar chart: Target vs Actual & Difference in report currency
+                  (when (and show-bar-chart? (pair? chart-nodes))
+                    (let ((bar-chart (gnc:make-html-chart)))
+                      (gnc:html-chart-set-type! bar-chart 'bar)
+                      (gnc:html-chart-set-stacking?! bar-chart #f)
+                      (gnc:html-chart-set-title!
+                       bar-chart
+                       (cons (format #f (G_ "~a — Target vs Actual (~a)")
+                                     report-title (qof-print-date (last dates-list)))
+                             (if filter-subtitle
+                                 (list filter-subtitle)
+                                 '())))
+                      (gnc:html-chart-set-width! bar-chart width)
+                      (gnc:html-chart-set-height! bar-chart height)
+                      (gnc:html-chart-set-format-style! bar-chart "currency")
+                      (gnc:html-chart-set-currency-iso!
+                       bar-chart (gnc-commodity-get-mnemonic report-currency))
+                      (gnc:html-chart-set-currency-symbol!
+                       bar-chart (gnc-commodity-get-nice-symbol report-currency))
+                      (gnc:html-chart-set-y-axis-label!
+                       bar-chart (gnc-commodity-get-mnemonic report-currency))
+                      (gnc:html-chart-set!
+                       bar-chart '(options scales yAxes (0) ticks beginAtZero) #t)
+                      (gnc:html-chart-set-grid?! bar-chart y-grid)
+                      (gnc:html-chart-set-tooltip-mode! bar-chart 'index)
+                      (gnc:html-chart-set-tooltip-non-zero-only! bar-chart #f)
+                      (gnc:html-chart-set-data-labels!
+                       bar-chart
+                       (map (lambda (n)
+                              (format #f "~a (~,1f% vs ~,1f%, ~a)"
+                                      (acct->name (node-acct n))
+                                      (node-actual-pct n)
+                                      (node-effective n)
+                                      (format-signed-pct (node-diff-pct-pts n) 1)))
+                            chart-nodes))
+                      (gnc:html-chart-add-data-series!
+                       bar-chart (G_ "Target")
+                       (map node-target-val chart-nodes)
+                       "#0074D9"
+                       'fill #t
+                       'borderWidth 1)
+                      (gnc:html-chart-add-data-series!
+                       bar-chart (G_ "Actual")
+                       (map node-actual-val chart-nodes)
+                       "#2E8B57"
+                       'fill #t
+                       'borderWidth 1)
+                      (gnc:html-chart-add-data-series!
+                       bar-chart (G_ "Difference (Actual - Target)")
+                       (map node-diff-val chart-nodes)
+                       (map (lambda (n)
+                              (if (>= (node-diff-val n) 0.0) "#2ECC40" "#FF4136"))
+                            chart-nodes)
+                       'fill #t
+                       'borderWidth 1)
+                      (gnc:html-document-add-object! document bar-chart)))
 
-                    (for-each
-                     (lambda (n color)
-                       (let ((label (acct->name (node-acct n)))
-                             (target-frac (/ (node-effective n) 100.0)))
-                         (gnc:html-chart-add-data-series!
-                          line-chart
-                          label
-                          (node-actual-pct-series n)
-                          color
-                          'fill #f
-                          'borderWidth line-width)
-                         (gnc:html-chart-add-data-series!
-                          line-chart
-                          (format #f (G_ "~a (Target)") label)
-                          (make-list num-dates target-frac)
-                          color
-                          'fill #f
-                          'borderWidth line-width
-                          'borderDash '(6 4)
-                          'pointRadius 0)))
-                     chart-nodes
-                     colors)
+                  ;; 2. Detailed rebalancing table (always lists all target accounts)
+                  (when show-table?
+                    (let* ((table (gnc:make-html-table))
+                           (min-depth (apply min (map node-depth table-nodes))))
+                      (gnc:html-table-set-style!
+                       table "table"
+                       'attribute (list "border" 0)
+                       'attribute (list "cellspacing" 0)
+                       'attribute (list "cellpadding" 4))
+                      (gnc:html-table-set-col-headers!
+                       table
+                       (list (G_ "Account")
+                             (G_ "Direct Target")
+                             (G_ "Effective Target")
+                             (G_ "Target Value")
+                             (G_ "Actual Value")
+                             (G_ "Actual %")
+                             (G_ "Difference")
+                             (G_ "Diff (% pts)")
+                             (G_ "Diff vs Target")))
+                      (for-each
+                       (lambda (n)
+                         (let* ((indent-levels (max 0 (- (node-depth n) min-depth)))
+                                (indent-str (string-concatenate
+                                             (make-list (* 3 indent-levels) "&#160;")))
+                                (name-cell (string-append indent-str
+                                                          (acct->name (node-acct n))))
+                                (direct-str (if (> (node-direct n) 1e-6)
+                                                (format #f "~,2f%" (node-direct n))
+                                                "—"))
+                                (eff-str (format #f "~,2f%" (node-effective n)))
+                                (diff-val (node-diff-val n))
+                                (diff-cell (gnc:make-html-table-cell/markup
+                                            "number-cell"
+                                            (format-signed-currency
+                                             report-currency diff-val))))
+                           (gnc:html-table-append-row!
+                            table
+                            (list name-cell
+                                  (gnc:make-html-table-cell/markup "number-cell" direct-str)
+                                  (gnc:make-html-table-cell/markup "number-cell" eff-str)
+                                  (gnc:make-html-table-cell/markup
+                                   "number-cell"
+                                   (float->monetary report-currency (node-target-val n)))
+                                  (gnc:make-html-table-cell/markup
+                                   "number-cell"
+                                   (float->monetary report-currency (node-actual-val n)))
+                                  (gnc:make-html-table-cell/markup
+                                   "number-cell"
+                                   (format #f "~,2f%" (node-actual-pct n)))
+                                  diff-cell
+                                  (gnc:make-html-table-cell/markup
+                                   "number-cell"
+                                   (format-signed-pct (node-diff-pct-pts n) 2))
+                                  (gnc:make-html-table-cell/markup
+                                   "number-cell"
+                                   (format-signed-pct (node-rel-diff-pct n) 2))))))
+                       table-nodes)
+                      (gnc:html-table-append-row/markup!
+                       table "grand-total"
+                       (list (gnc:make-html-table-cell/markup "total-label-cell"
+                                                              (G_ "Total Portfolio"))
+                             (gnc:make-html-table-cell/markup "total-number-cell"
+                                                              (format #f "~,2f%" total-direct))
+                             (gnc:make-html-table-cell/markup "total-number-cell" "100.00%")
+                             (gnc:make-html-table-cell/markup
+                              "total-number-cell"
+                              (float->monetary report-currency total-end-val))
+                             (gnc:make-html-table-cell/markup
+                              "total-number-cell"
+                              (float->monetary report-currency total-end-val))
+                             (gnc:make-html-table-cell/markup "total-number-cell" "100.00%")
+                             (gnc:make-html-table-cell/markup
+                              "total-number-cell"
+                              (float->monetary report-currency 0.0))
+                             (gnc:make-html-table-cell/markup "total-number-cell" "0.00%")
+                             (gnc:make-html-table-cell/markup "total-number-cell" "0.00%")))
+                      (gnc:html-document-add-object! document table)))
 
-                    (gnc:html-document-add-object! document line-chart)))
+                  ;; 3. Over-time line chart: solid Actual % vs dashed Target % with matching color
+                  (when (and show-time-chart? (pair? chart-nodes))
+                    (let ((line-chart (gnc:make-html-chart))
+                          (colors (gnc:assign-colors (length chart-nodes))))
+                      (gnc:html-chart-set-type! line-chart 'line)
+                      (gnc:html-chart-set-title!
+                       line-chart
+                       (cons (format #f (G_ "~a — Allocation Over Time") report-title)
+                             (cons (gnc-date-interval-format from-date-t64 to-date-t64)
+                                   (if filter-subtitle
+                                       (list filter-subtitle)
+                                       '()))))
+                      (gnc:html-chart-set-width! line-chart width)
+                      (gnc:html-chart-set-height! line-chart height)
+                      (gnc:html-chart-set-format-style! line-chart "percent")
+                      (gnc:html-chart-set-currency-iso!
+                       line-chart (gnc-commodity-get-mnemonic report-currency))
+                      (gnc:html-chart-set-currency-symbol!
+                       line-chart (gnc-commodity-get-nice-symbol report-currency))
+                      (gnc:html-chart-set-y-axis-label! line-chart (G_ "Allocation (%)"))
+                      (gnc:html-chart-set!
+                       line-chart '(options scales yAxes (0) ticks beginAtZero) #t)
+                      (gnc:html-chart-set-data-labels! line-chart date-string-list)
+                      (gnc:html-chart-set-grid?! line-chart y-grid)
+                      (gnc:html-chart-set-tooltip-mode! line-chart 'index)
+                      (gnc:html-chart-set-tooltip-non-zero-only! line-chart #f)
 
-                ;; 4. CSV export
-                (when (eq? export-type 'csv)
-                  (gnc:html-document-set-export-string
-                   document
-                   (gnc:lists->csv
-                    (cons (list (G_ "Account")
-                                (G_ "Direct Target (%)")
-                                (G_ "Effective Target (%)")
-                                (G_ "Target Value")
-                                (G_ "Actual Value")
-                                (G_ "Actual (%)")
-                                (G_ "Difference")
-                                (G_ "Diff (% pts)")
-                                (G_ "Diff vs Target (%)"))
-                          (append
-                           (map (lambda (n)
-                                  (list (gnc-account-get-full-name (node-acct n))
-                                        (node-direct n)
-                                        (node-effective n)
-                                        (node-target-val n)
-                                        (node-actual-val n)
-                                        (node-actual-pct n)
-                                        (node-diff-val n)
-                                        (node-diff-pct-pts n)
-                                        (node-rel-diff-pct n)))
-                                table-nodes)
-                           (list (list (G_ "Total Portfolio")
-                                       total-direct
-                                       100.0
-                                       total-end-val
-                                       total-end-val
-                                       100.0
-                                       0.0
-                                       0.0
-                                       0.0)))))))))))))))
+                      (for-each
+                       (lambda (n color)
+                         (let ((label (acct->name (node-acct n)))
+                               (target-frac (/ (node-effective n) 100.0)))
+                           (gnc:html-chart-add-data-series!
+                            line-chart
+                            label
+                            (node-actual-pct-series n)
+                            color
+                            'fill #f
+                            'borderWidth line-width)
+                           (gnc:html-chart-add-data-series!
+                            line-chart
+                            (format #f (G_ "~a (Target)") label)
+                            (make-list num-dates target-frac)
+                            color
+                            'fill #f
+                            'borderWidth line-width
+                            'borderDash '(6 4)
+                            'pointRadius 0)))
+                       chart-nodes
+                       colors)
+
+                      (gnc:html-document-add-object! document line-chart)))
+
+                  ;; 4. CSV export
+                  (when (eq? export-type 'csv)
+                    (gnc:html-document-set-export-string
+                     document
+                     (gnc:lists->csv
+                      (cons (list (G_ "Account")
+                                  (G_ "Direct Target (%)")
+                                  (G_ "Effective Target (%)")
+                                  (G_ "Target Value")
+                                  (G_ "Actual Value")
+                                  (G_ "Actual (%)")
+                                  (G_ "Difference")
+                                  (G_ "Diff (% pts)")
+                                  (G_ "Diff vs Target (%)"))
+                            (append
+                             (map (lambda (n)
+                                    (list (gnc-account-get-full-name (node-acct n))
+                                          (node-direct n)
+                                          (node-effective n)
+                                          (node-target-val n)
+                                          (node-actual-val n)
+                                          (node-actual-pct n)
+                                          (node-diff-val n)
+                                          (node-diff-pct-pts n)
+                                          (node-rel-diff-pct n)))
+                                  table-nodes)
+                             (list (list (G_ "Total Portfolio")
+                                         total-direct
+                                         100.0
+                                         total-end-val
+                                         total-end-val
+                                         100.0
+                                         0.0
+                                         0.0
+                                         0.0))))))))))))))))
 
     (unless (gnc:html-document-export-string document)
       (gnc:html-document-set-export-error document (G_ "No exportable data")))

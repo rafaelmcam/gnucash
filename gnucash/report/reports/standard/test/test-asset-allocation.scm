@@ -45,6 +45,7 @@
   (parent-zero-children-targeted-test)
   (parent-targeted-children-zero-satisfied-test)
   (over-time-chart-colors-and-dashed-target-test)
+  (chart-filtering-test)
   (csv-export-test)
   (test-end "test-asset-allocation"))
 
@@ -391,4 +392,125 @@
                  (string-contains csv "Effective Target (%)")
                  (string-contains csv "Equities")
                  (string-contains csv "Total Portfolio"))))))
+    (teardown)))
+
+(define (chart-filtering-test)
+  (test-group-with-cleanup "chart-filtering"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (accounts (env-create-account-structure-alist
+                      env
+                      (list "Root"
+                            (list (cons 'type ACCT-TYPE-ASSET))
+                            (list "A1")
+                            (list "A2")
+                            (list "A3")
+                            (list "A4")
+                            (list "A5")
+                            (list "A6")
+                            (list "A7")
+                            (list "A8")
+                            (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY))))))
+           (names '("A1" "A2" "A3" "A4" "A5" "A6" "A7" "A8"))
+           (pcts  '(25.0 20.0 15.0 12.0 10.0 8.0 6.0 4.0))
+           (equity (cdr (assoc "Equity" accounts))))
+      (for-each
+       (lambda (name pct)
+         (env-transfer env 10 01 2025 equity (cdr (assoc name accounts))
+                       (inexact->exact (round (* pct 10)))))
+       names pcts)
+
+      (let ((alloc-val (apply alloc-spec
+                              (map (lambda (name pct)
+                                     (alloc-pair (cdr (assoc name accounts)) pct))
+                                   names pcts))))
+        ;; 1. Default ('top-n = 6): charts show 6 largest, table shows all 8
+        (let ((options (gnc:make-report-options asset-allocation-uuid)))
+          (set-option! options "General" "Start Date"
+                       (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+          (set-option! options "General" "End Date"
+                       (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+          (set-option! options "Allocation" "Target Allocations" alloc-val)
+          (let* ((html (gnc:options->render asset-allocation-uuid options
+                                            "test-asset-allocation" "filter-default"))
+                 (charts (extract-chartjs-json-list html))
+                 (sxml (gnc:options->sxml asset-allocation-uuid options
+                                          "test-asset-allocation" "filter-default"
+                                          #:strip-tag "script"))
+                 (bar-labels (vector->list
+                              (assoc-ref (assoc-ref (car charts) "data") "labels")))
+                 (line-datasets (vector->list
+                                 (assoc-ref (assoc-ref (cadr charts) "data") "datasets"))))
+            (test-equal "default filter shows 6 bars" 6 (length bar-labels))
+            (test-equal "default filter shows 12 line datasets (6 actual + 6 target)"
+              12 (length line-datasets))
+            (test-assert "table still includes small accounts A7 and A8"
+              (and (find-table-row sxml "A7")
+                   (find-table-row sxml "A8")))))
+
+        ;; 2. Minimum % filter (Y = 10.0% -> A1..A5 = 5 accounts in charts, all 8 in table)
+        (let ((options (gnc:make-report-options asset-allocation-uuid)))
+          (set-option! options "General" "Start Date"
+                       (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+          (set-option! options "General" "End Date"
+                       (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+          (set-option! options "Allocation" "Target Allocations" alloc-val)
+          (set-option! options "Display" "Chart Account Filter" 'min-pct)
+          (set-option! options "Display" "Minimum Allocation in Charts (%)" 10.0)
+          (let* ((html (gnc:options->render asset-allocation-uuid options
+                                            "test-asset-allocation" "filter-min"))
+                 (charts (extract-chartjs-json-list html))
+                 (sxml (gnc:options->sxml asset-allocation-uuid options
+                                          "test-asset-allocation" "filter-min"
+                                          #:strip-tag "script"))
+                 (bar-labels (vector->list
+                              (assoc-ref (assoc-ref (car charts) "data") "labels")))
+                 (line-datasets (vector->list
+                                 (assoc-ref (assoc-ref (cadr charts) "data") "datasets"))))
+            (test-equal "min-pct=10% shows 5 bars" 5 (length bar-labels))
+            (test-equal "min-pct=10% shows 10 line datasets" 10 (length line-datasets))
+            (test-assert "table still includes A6, A7, A8"
+              (and (find-table-row sxml "A6")
+                   (find-table-row sxml "A7")
+                   (find-table-row sxml "A8")))))
+
+        ;; 3. 'all mode -> all 8 accounts in charts
+        (let ((options (gnc:make-report-options asset-allocation-uuid)))
+          (set-option! options "General" "Start Date"
+                       (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+          (set-option! options "General" "End Date"
+                       (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+          (set-option! options "Allocation" "Target Allocations" alloc-val)
+          (set-option! options "Display" "Chart Account Filter" 'all)
+          (let* ((html (gnc:options->render asset-allocation-uuid options
+                                            "test-asset-allocation" "filter-all"))
+                 (charts (extract-chartjs-json-list html))
+                 (bar-labels (vector->list
+                              (assoc-ref (assoc-ref (car charts) "data") "labels")))
+                 (line-datasets (vector->list
+                                 (assoc-ref (assoc-ref (cadr charts) "data") "datasets"))))
+            (test-equal "all mode shows 8 bars" 8 (length bar-labels))
+            (test-equal "all mode shows 16 line datasets" 16 (length line-datasets))))
+
+        ;; 4. 'min-pct = 90.0% -> 0 charts + notice + full table intact
+        (let ((options (gnc:make-report-options asset-allocation-uuid)))
+          (set-option! options "General" "Start Date"
+                       (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+          (set-option! options "General" "End Date"
+                       (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+          (set-option! options "Allocation" "Target Allocations" alloc-val)
+          (set-option! options "Display" "Chart Account Filter" 'min-pct)
+          (set-option! options "Display" "Minimum Allocation in Charts (%)" 90.0)
+          (let* ((html (gnc:options->render asset-allocation-uuid options
+                                            "test-asset-allocation" "filter-none"))
+                 (charts (extract-chartjs-json-list html))
+                 (sxml (gnc:options->sxml asset-allocation-uuid options
+                                          "test-asset-allocation" "filter-none"
+                                          #:strip-tag "script")))
+            (test-equal "min-pct=90% renders 0 charts" 0 (length charts))
+            (test-assert "shows threshold notice"
+              (string-contains (sxml->text sxml) "No accounts meet the chart filter threshold"))
+            (test-assert "full table still shows A1 and A8"
+              (and (find-table-row sxml "A1")
+                   (find-table-row sxml "A8")))))))
     (teardown)))
