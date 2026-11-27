@@ -352,7 +352,9 @@ GncOptionsDialog::build_contents(GncOptionDB  *odb, bool show_dialog)
         [this, default_section, &default_page, &has_allocation_option]
         (GncOptionSectionPtr& section) {
             section->foreach_option([&has_allocation_option](GncOption& opt) {
-                if (opt.get_ui_type() == GncOptionUIType::ACCOUNT_ALLOCATION)
+                auto uitype = opt.get_ui_type();
+                if (uitype == GncOptionUIType::ACCOUNT_ALLOCATION ||
+                    uitype == GncOptionUIType::MACRO_CLASSES)
                     has_allocation_option = true;
             });
             auto page = dialog_append_page(this, section);
@@ -365,8 +367,8 @@ GncOptionsDialog::build_contents(GncOptionDB  *odb, bool show_dialog)
         int width = 0, height = 0;
         gtk_window_get_size(GTK_WINDOW(m_window), &width, &height);
         gtk_window_resize(GTK_WINDOW(m_window),
-                          std::max(width, 860),
-                          std::max(height, 640));
+                          std::max(width, 960),
+                          std::max(height, 660));
     }
 
     gtk_notebook_popup_enable(GTK_NOTEBOOK(m_notebook));

@@ -102,6 +102,26 @@ TEST_F(GncOptionDBTest, test_register_account_allocation_option)
                  m_db->lookup_string_option("Allocation", "Target Allocations").c_str());
 }
 
+TEST_F(GncOptionDBTest, test_register_macro_classes_option)
+{
+    gnc_register_macro_classes_option(
+        m_db, "Macro Classes", "Macro Classes", "a",
+        "Cross-cutting macro classes", std::string{""});
+    auto option{m_db->find_option("Macro Classes", "Macro Classes")};
+    ASSERT_NE(nullptr, option);
+    EXPECT_EQ(GncOptionUIType::MACRO_CLASSES, option->get_ui_type());
+    EXPECT_TRUE(option->get_value<std::string>().empty());
+
+    std::string val{"Selicados=25.00;IPCA=0.00"};
+    option->set_value(val);
+    EXPECT_STREQ(val.c_str(),
+                 m_db->lookup_string_option("Macro Classes", "Macro Classes").c_str());
+    EXPECT_STREQ(val.c_str(), option->serialize().c_str());
+    option->deserialize("Exterior=30.00");
+    EXPECT_STREQ("Exterior=30.00",
+                 m_db->lookup_string_option("Macro Classes", "Macro Classes").c_str());
+}
+
 TEST_F(GncOptionDBTest, test_register_report_placement_option)
 {
     uint32_t report_id = 456;

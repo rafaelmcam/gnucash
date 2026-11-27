@@ -46,6 +46,7 @@
   (parent-targeted-children-zero-satisfied-test)
   (over-time-chart-colors-and-dashed-target-test)
   (chart-filtering-test)
+  (macro-classes-test)
   (csv-export-test)
   (test-end "test-asset-allocation"))
 
@@ -513,4 +514,211 @@
             (test-assert "full table still shows A1 and A8"
               (and (find-table-row sxml "A1")
                    (find-table-row sxml "A8")))))))
+    (teardown)))
+
+(define (macro-classes-test)
+  (test-group-with-cleanup "macro-classes"
+    (let* ((env (create-test-env))
+           (book (gnc-get-current-book))
+           (accounts (env-create-account-structure-alist
+                      env
+                      (list "Root"
+                            (list (cons 'type ACCT-TYPE-ASSET))
+                            (list "BrokerA"
+                                  (list "SelicBond"))
+                            (list "BankB"
+                                  (list "CDB"))
+                            (list "Stocks"
+                                  (list "SubStock1")
+                                  (list "SubStock2"))
+                            (list "SmallAsset")
+                            (list "Equity" (list (cons 'type ACCT-TYPE-EQUITY))))))
+           (selic (cdr (assoc "SelicBond" accounts)))
+           (cdb (cdr (assoc "CDB" accounts)))
+           (stocks (cdr (assoc "Stocks" accounts)))
+           (sub1 (cdr (assoc "SubStock1" accounts)))
+           (sub2 (cdr (assoc "SubStock2" accounts)))
+           (small (cdr (assoc "SmallAsset" accounts)))
+           (equity (cdr (assoc "Equity" accounts))))
+      (env-transfer env 10 01 2025 equity selic 150)
+      (env-transfer env 10 01 2025 equity cdb 100)
+      (env-transfer env 10 01 2025 equity sub1 400)
+      (env-transfer env 10 01 2025 equity sub2 270)
+      (env-transfer env 10 01 2025 equity small 80)
+
+      ;; 1. Virtual parents composing 100%: Selicados=25% (accounts 0%), SmallMacro=8% (0%),
+      ;;    plus Stocks:SubStock1=40% and SubStock2=27% -> 25 + 8 + 40 + 27 = 100%.
+      (let ((options (gnc:make-report-options asset-allocation-uuid))
+            (alloc-val
+             (alloc-spec (format #f "~a=0.00|Selicados" (gncAccountGetGUID selic))
+                         (format #f "~a=0.00|Selicados" (gncAccountGetGUID cdb))
+                         (alloc-pair sub1 40.0)
+                         (alloc-pair sub2 27.0)
+                         (format #f "~a=0.00|SmallMacro" (gncAccountGetGUID small)))))
+        (set-option! options "General" "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+        (set-option! options "General" "End Date"
+                     (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+        (set-option! options "Allocation" "Target Allocations" alloc-val)
+        (set-option! options "Macro Classes" "Macro Classes"
+                     "Selicados=25.00;SmallMacro=8.00")
+        (let* ((sxml (gnc:options->sxml asset-allocation-uuid options
+                                        "test-asset-allocation" "macro-virtual-parent"
+                                        #:strip-tag "script"))
+               (selic-row (find-table-row sxml "Selicados"))
+               (selic-cells (map sxml->text ((sxpath '(td)) selic-row)))
+               (small-row (find-table-row sxml "SmallMacro"))
+               (html (gnc:options->render asset-allocation-uuid options
+                                         "test-asset-allocation" "macro-virtual-parent"))
+               (charts (extract-chartjs-json-list html))
+               (bar-labels (vector->list
+                            (assoc-ref (assoc-ref (car charts) "data") "labels")))
+               (line-datasets (vector->list
+                               (assoc-ref (assoc-ref (cadr charts) "data") "datasets")))
+               (find-ds (lambda (lbl)
+                          (find (lambda (d) (equal? (assoc-ref d "label") lbl))
+                                line-datasets)))
+               (macro-actual (find-ds "[Macro] Selicados"))
+               (macro-target (find-ds "[Macro] Selicados (Target)")))
+          (test-assert "Selicados appears in macro table" selic-row)
+          (test-assert "SmallMacro appears in macro table" small-row)
+          (test-equal "Selicados explicit target is 25.00%" "25.00%" (list-ref selic-cells 2))
+          (test-equal "Selicados accounts sum is 0.00%" "0.00%" (list-ref selic-cells 3))
+          (test-equal "Selicados effective target is 25.00%" "25.00%" (list-ref selic-cells 4))
+          (test-assert "Selicados actual value aggregates cross-tree (250.00)"
+            (string-contains (list-ref selic-cells 6) "250.00"))
+          (test-equal "Selicados diff % pts is 0.00%" "0.00%" (list-ref selic-cells 9))
+          (test-assert "Bar chart includes [Macro] Selicados (>10%)"
+            (any (lambda (l) (string-contains l "[Macro] Selicados")) bar-labels))
+          (test-assert "Bar chart excludes [Macro] SmallMacro (<=10%)"
+            (not (any (lambda (l) (string-contains l "[Macro] SmallMacro")) bar-labels)))
+          (test-assert "Line chart includes [Macro] Selicados solid & dashed target"
+            (and macro-actual macro-target))
+          (test-equal "Macro actual & target share exact same color"
+            (assoc-ref macro-actual "borderColor")
+            (assoc-ref macro-target "borderColor"))
+          (test-equal "Macro target line is dashed [6, 4]"
+            #(6 4)
+            (assoc-ref macro-target "borderDash"))
+          (test-assert "Line chart excludes [Macro] SmallMacro (<=10%)"
+            (not (find-ds "[Macro] SmallMacro")))))
+
+      ;; 2. Accounts inside macro class have direct % <= macro target (slack allowed; still sums to 100%)
+      (let ((options (gnc:make-report-options asset-allocation-uuid)))
+        (set-option! options "General" "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+        (set-option! options "General" "End Date"
+                     (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+        (set-option! options "Allocation" "Target Allocations"
+                     (alloc-spec (format #f "~a=10.00|Selicados" (gncAccountGetGUID selic))
+                                 (format #f "~a=10.00|Selicados" (gncAccountGetGUID cdb))
+                                 (alloc-pair sub1 40.0)
+                                 (alloc-pair sub2 27.0)
+                                 (alloc-pair small 8.0)))
+        (set-option! options "Macro Classes" "Macro Classes" "Selicados=25.00")
+        (let* ((sxml (gnc:options->sxml asset-allocation-uuid options
+                                        "test-asset-allocation" "macro-slack"
+                                        #:strip-tag "script"))
+               (selic-row (find-table-row sxml "Selicados"))
+               (selic-cells (map sxml->text ((sxpath '(td)) selic-row)))
+               (selic-acct-row (find-table-row sxml "SelicBond"))
+               (selic-acct-cells (map sxml->text ((sxpath '(td)) selic-acct-row)))
+               (template (gnc:find-report-template asset-allocation-uuid))
+               (report-id (gnc:make-report asset-allocation-uuid options))
+               (report-obj (gnc-report-find report-id))
+               (doc ((gnc:report-template-export-thunk template) report-obj 'csv))
+               (csv (gnc:html-document-export-string doc)))
+          (test-equal "Explicit target shows 25.00%" "25.00%" (list-ref selic-cells 2))
+          (test-equal "Accounts sum shows 20.00%" "20.00%" (list-ref selic-cells 3))
+          (test-equal "Effective target uses 25.00%" "25.00%" (list-ref selic-cells 4))
+          (test-assert "Target value is 250.00" (string-contains (list-ref selic-cells 5) "250.00"))
+          (test-equal "Diff % pts is 0.00%" "0.00%" (list-ref selic-cells 9))
+          (test-equal "SelicBond direct target shows 10.00%" "10.00%" (list-ref selic-acct-cells 2))
+          (test-assert "CSV export includes Macro Class section"
+            (and (string-contains csv "Macro Class")
+                 (string-contains csv "Selicados")))))
+
+      ;; 3. Validation error when accounts inside macro class exceed macro target (30% > 25%)
+      (let ((options (gnc:make-report-options asset-allocation-uuid)))
+        (set-option! options "General" "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+        (set-option! options "General" "End Date"
+                     (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+        (set-option! options "Allocation" "Target Allocations"
+                     (alloc-spec (format #f "~a=15.00|Selicados" (gncAccountGetGUID selic))
+                                 (format #f "~a=15.00|Selicados" (gncAccountGetGUID cdb))
+                                 (alloc-pair sub1 75.0)))
+        (set-option! options "Macro Classes" "Macro Classes" "Selicados=25.00")
+        (let ((sxml (gnc:options->sxml asset-allocation-uuid options
+                                       "test-asset-allocation" "macro-exceeded"
+                                       #:strip-tag "script")))
+          (test-assert "shows Macro class target exceeded warning"
+            (string-contains (sxml->text sxml) "Macro class target exceeded"))))
+
+      ;; 4. Validation error when outside_macros + macro_effective != 100% (17 + 25 = 42%)
+      (let ((options (gnc:make-report-options asset-allocation-uuid)))
+        (set-option! options "General" "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+        (set-option! options "General" "End Date"
+                     (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+        (set-option! options "Allocation" "Target Allocations"
+                     (alloc-spec (format #f "~a=10.00|Selicados" (gncAccountGetGUID selic))
+                                 (format #f "~a=10.00|Selicados" (gncAccountGetGUID cdb))
+                                 (alloc-pair small 17.0)))
+        (set-option! options "Macro Classes" "Macro Classes" "Selicados=25.00")
+        (let ((sxml (gnc:options->sxml asset-allocation-uuid options
+                                       "test-asset-allocation" "macro-bad-sum"
+                                       #:strip-tag "script")))
+          (test-assert "total outside + macro != 100% triggers warning"
+            (and (string-contains (sxml->text sxml) "Target allocations must sum to 100%")
+                 (string-contains (sxml->text sxml) "42.00%")))))
+
+      ;; 5. 100% macro-only portfolio (zero direct targets on any account)
+      (let ((options (gnc:make-report-options asset-allocation-uuid)))
+        (set-option! options "General" "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+        (set-option! options "General" "End Date"
+                     (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+        (set-option! options "Allocation" "Target Allocations"
+                     (alloc-spec (format #f "~a=0.00|Selicados" (gncAccountGetGUID selic))
+                                 (format #f "~a=0.00|Selicados" (gncAccountGetGUID cdb))
+                                 (format #f "~a=0.00|Equities" (gncAccountGetGUID stocks))
+                                 (format #f "~a=0.00|Equities" (gncAccountGetGUID small))))
+        (set-option! options "Macro Classes" "Macro Classes"
+                     "Selicados=25.00;Equities=75.00")
+        (let* ((sxml (gnc:options->sxml asset-allocation-uuid options
+                                        "test-asset-allocation" "macro-only"
+                                        #:strip-tag "script"))
+               (total-row (find-table-row sxml "Total Portfolio"))
+               (selic-row (find-table-row sxml "Selicados")))
+          (test-assert "macro-only renders Total Portfolio without crashing" total-row)
+          (test-assert "macro-only includes Selicados row" selic-row)))
+
+      ;; 6. Inherited 0% macro + ancestor+descendant deduplication + escaped special chars
+      (let ((options (gnc:make-report-options asset-allocation-uuid))
+            (escaped-macro "Renda%3DPós%7C50%25%3B1")
+            (decoded-macro "Renda=Pós|50%;1"))
+        (set-option! options "General" "Start Date"
+                     (cons 'absolute (gnc-dmy2time64 01 01 2025)))
+        (set-option! options "General" "End Date"
+                     (cons 'absolute (gnc-dmy2time64 31 03 2025)))
+        (set-option! options "Allocation" "Target Allocations"
+                     (alloc-spec (format #f "~a=0.00|~a" (gncAccountGetGUID stocks) escaped-macro)
+                                 (format #f "~a=40.00|~a" (gncAccountGetGUID sub1) escaped-macro)
+                                 (alloc-pair sub2 27.0)
+                                 (alloc-pair selic 15.0)
+                                 (alloc-pair cdb 10.0)
+                                 (alloc-pair small 8.0)))
+        (set-option! options "Macro Classes" "Macro Classes"
+                     (format #f "~a=0.00" escaped-macro))
+        (let* ((sxml (gnc:options->sxml asset-allocation-uuid options
+                                        "test-asset-allocation" "macro-dedup"
+                                        #:strip-tag "script"))
+               (macro-row (find-table-row sxml decoded-macro))
+               (macro-cells (map sxml->text ((sxpath '(td)) macro-row))))
+          (test-assert "Escaped special characters decoded in macro table" macro-row)
+          (test-equal "Inherited+deduplicated ancestor/child sum is 67.00%"
+            "67.00%" (list-ref macro-cells 3))
+          (test-assert "Inherited+deduplicated actual value is 670.00"
+            (string-contains (list-ref macro-cells 6) "670.00")))))
     (teardown)))

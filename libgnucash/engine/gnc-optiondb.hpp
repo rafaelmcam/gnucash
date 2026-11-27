@@ -162,6 +162,37 @@ inline void gnc_register_account_allocation_option(const GncOptionDBPtr& db,
 }
 
 /**
+ * Create a new macro classes option and register it in the options database.
+ *
+ * @param db A GncOptionDB* for calling from C. Caller retains ownership.
+ * @param section The database section for the option.
+ * @param name The option name.
+ * @param key A short tag used to sort the controls in the dialog.
+ * @param doc_string A description of the option.
+ * @param value The initial and default value for the option.
+ */
+void gnc_register_macro_classes_option(GncOptionDB* db,
+                                       const char* section,
+                                       const char* name,
+                                       const char* key,
+                                       const char* doc_string,
+                                       std::string value);
+
+/**
+ * As above but takes a const GncOptionDBPtr& for calling from C++.
+ */
+inline void gnc_register_macro_classes_option(const GncOptionDBPtr& db,
+                                              const char* section,
+                                              const char* name,
+                                              const char* key,
+                                              const char* doc_string,
+                                              std::string value)
+{
+    gnc_register_macro_classes_option(db.get(), section, name, key,
+                                      doc_string, std::move(value));
+}
+
+/**
  * Create a new font option and register it in the options database.
  *
  * @param db A GncOptionDB* for calling from C. Caller retains ownership.

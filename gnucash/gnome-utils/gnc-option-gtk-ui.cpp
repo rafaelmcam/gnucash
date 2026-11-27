@@ -1950,8 +1950,23 @@ enum AllocationColumns
     ALLOC_COL_DIRECT_TEXT,
     ALLOC_COL_SUBTREE_VAL,
     ALLOC_COL_SUBTREE_TEXT,
+    ALLOC_COL_MACRO_NAME,
+    ALLOC_COL_MACRO_EFF_TEXT,
     ALLOC_COL_WEIGHT,
     NUM_ALLOC_COLS
+};
+
+enum MacroClassColumns
+{
+    MACRO_COL_NAME = 0,
+    MACRO_COL_EXPLICIT_VAL,
+    MACRO_COL_EXPLICIT_TEXT,
+    MACRO_COL_ACCTS_SUM_VAL,
+    MACRO_COL_ACCTS_SUM_TEXT,
+    MACRO_COL_EFFECTIVE_VAL,
+    MACRO_COL_EFFECTIVE_TEXT,
+    MACRO_COL_ACCOUNTS_DESC,
+    NUM_MACRO_COLS
 };
 
 std::string
@@ -1962,10 +1977,65 @@ account_guid_str(const Account* acc)
     return std::string{guid_buf};
 }
 
-std::map<std::string, double>
-parse_allocation_string(const std::string& raw)
+std::string
+trim_ws(const std::string& s)
 {
-    std::map<std::string, double> result;
+    auto first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return {};
+    auto last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1);
+}
+
+std::string
+escape_alloc_token(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+    {
+        switch (c)
+        {
+            case '%': out += "%25"; break;
+            case ';': out += "%3B"; break;
+            case '=': out += "%3D"; break;
+            case '|': out += "%7C"; break;
+            default:  out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
+std::string
+unescape_alloc_token(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] == '%' && i + 2 < s.size())
+        {
+            auto hex = s.substr(i + 1, 2);
+            if (hex == "25") { out.push_back('%'); i += 2; continue; }
+            if (hex == "3B" || hex == "3b") { out.push_back(';'); i += 2; continue; }
+            if (hex == "3D" || hex == "3d") { out.push_back('='); i += 2; continue; }
+            if (hex == "7C" || hex == "7c") { out.push_back('|'); i += 2; continue; }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
+struct ParsedAllocations
+{
+    std::map<std::string, double> direct;
+    std::map<std::string, std::string> macros;
+};
+
+ParsedAllocations
+parse_allocation_entries(const std::string& raw)
+{
+    ParsedAllocations parsed;
     std::istringstream iss{raw};
     std::string token;
     while (std::getline(iss, token, ';'))
@@ -1973,16 +2043,29 @@ parse_allocation_string(const std::string& raw)
         auto eq_pos = token.find('=');
         if (eq_pos == std::string::npos || eq_pos == 0)
             continue;
-        std::string guid = token.substr(0, eq_pos);
-        std::string val_str = token.substr(eq_pos + 1);
-        if (val_str.empty())
+        std::string guid = trim_ws(token.substr(0, eq_pos));
+        if (guid.empty())
             continue;
-        char* endptr = nullptr;
-        double val = g_ascii_strtod(val_str.c_str(), &endptr);
-        if (endptr && *endptr == '\0' && std::isfinite(val) && val > 1e-6)
-            result[guid] = val;
+        std::string rhs = token.substr(eq_pos + 1);
+        auto pipe_pos = rhs.find('|');
+        std::string val_str = trim_ws(
+            pipe_pos == std::string::npos ? rhs : rhs.substr(0, pipe_pos));
+        std::string macro_name =
+            pipe_pos == std::string::npos
+                ? std::string{}
+                : trim_ws(unescape_alloc_token(rhs.substr(pipe_pos + 1)));
+
+        if (!val_str.empty())
+        {
+            char* endptr = nullptr;
+            double val = g_ascii_strtod(val_str.c_str(), &endptr);
+            if (endptr && *endptr == '\0' && std::isfinite(val) && val > 1e-6)
+                parsed.direct[guid] = val;
+        }
+        if (!macro_name.empty())
+            parsed.macros[guid] = macro_name;
     }
-    return result;
+    return parsed;
 }
 
 std::string
@@ -2007,19 +2090,88 @@ format_allocation_number(double val)
 }
 
 std::string
-serialize_allocation_map(const std::map<std::string, double>& allocs)
+serialize_allocation_entries(const std::map<std::string, double>& allocs,
+                             const std::map<std::string, std::string>& macros)
 {
     std::ostringstream oss;
     oss.imbue(std::locale::classic());
-    bool first = true;
+    std::map<std::string, std::pair<double, std::string>> merged;
     for (const auto& [guid, val] : allocs)
     {
-        if (val <= 1e-6)
+        if (val > 1e-6)
+            merged[guid].first = val;
+    }
+    for (const auto& [guid, macro] : macros)
+    {
+        if (!macro.empty())
+            merged[guid].second = macro;
+    }
+
+    bool first = true;
+    for (const auto& [guid, entry] : merged)
+    {
+        if (entry.first <= 1e-6 && entry.second.empty())
             continue;
         if (!first)
             oss << ';';
         first = false;
-        oss << guid << '=' << format_allocation_number(val);
+        oss << guid << '=' << format_allocation_number(entry.first);
+        if (!entry.second.empty())
+            oss << '|' << escape_alloc_token(entry.second);
+    }
+    return oss.str();
+}
+
+std::vector<std::pair<std::string, double>>
+parse_macro_classes_string(const std::string& raw)
+{
+    std::vector<std::pair<std::string, double>> result;
+    std::istringstream iss{raw};
+    std::string token;
+    while (std::getline(iss, token, ';'))
+    {
+        auto eq_pos = token.find('=');
+        std::string raw_name = (eq_pos == std::string::npos)
+                                   ? token
+                                   : token.substr(0, eq_pos);
+        std::string name = trim_ws(unescape_alloc_token(raw_name));
+        if (name.empty())
+            continue;
+        double val = 0.0;
+        if (eq_pos != std::string::npos)
+        {
+            std::string val_str = trim_ws(token.substr(eq_pos + 1));
+            if (!val_str.empty())
+            {
+                char* endptr = nullptr;
+                double parsed = g_ascii_strtod(val_str.c_str(), &endptr);
+                if (endptr && *endptr == '\0' && std::isfinite(parsed) &&
+                    parsed > 1e-6 && parsed <= 100.0)
+                    val = parsed;
+            }
+        }
+        bool dup = std::any_of(result.begin(), result.end(),
+                               [&name](const auto& p) { return p.first == name; });
+        if (!dup)
+            result.emplace_back(std::move(name), val);
+    }
+    return result;
+}
+
+std::string
+serialize_macro_classes(const std::vector<std::pair<std::string, double>>& list)
+{
+    std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    bool first = true;
+    for (const auto& [name, val] : list)
+    {
+        if (name.empty())
+            continue;
+        if (!first)
+            oss << ';';
+        first = false;
+        oss << escape_alloc_token(name) << '=' << format_allocation_number(val);
     }
     return oss.str();
 }
@@ -2091,19 +2243,24 @@ is_allocation_account_type(GNCAccountType type)
 
 bool
 account_should_show(Account* acc, bool show_hidden,
-                    const std::map<std::string, double>& allocs)
+                    const std::map<std::string, double>& allocs,
+                    const std::map<std::string, std::string>& macros)
 {
     if (!acc)
         return false;
     const bool is_hidden = xaccAccountGetHidden(acc);
-    auto it = allocs.find(account_guid_str(acc));
+    const std::string guid = account_guid_str(acc);
+    auto it = allocs.find(guid);
     const bool has_direct_alloc = (it != allocs.end() && it->second > 1e-6);
+    auto mit = macros.find(guid);
+    const bool has_macro = (mit != macros.end() && !mit->second.empty());
 
     bool child_visible = false;
     GList* children = gnc_account_get_children_sorted(acc);
     for (GList* n = children; n; n = n->next)
     {
-        if (account_should_show(static_cast<Account*>(n->data), show_hidden, allocs))
+        if (account_should_show(static_cast<Account*>(n->data), show_hidden,
+                                allocs, macros))
         {
             child_visible = true;
             break;
@@ -2111,35 +2268,129 @@ account_should_show(Account* acc, bool show_hidden,
     }
     g_list_free(children);
 
-    if (has_direct_alloc || child_visible)
+    if (has_direct_alloc || has_macro || child_visible)
         return true;
     if (is_hidden && !show_hidden)
         return false;
     return is_allocation_account_type(xaccAccountGetType(acc));
 }
 
+struct MacroAccountSummary
+{
+    double accounts_sum = 0.0;
+    std::vector<std::string> account_names;
+};
+
+struct AllocationTotalsSnapshot
+{
+    double outside_macros_direct = 0.0;
+    std::map<std::string, MacroAccountSummary> summaries;
+};
+
 } // namespace
+
+class GncGtkAccountAllocationUIItem;
+class GncGtkMacroClassesUIItem;
+
+namespace {
+std::vector<GncGtkAccountAllocationUIItem*> s_alloc_ui_items;
+std::vector<GncGtkMacroClassesUIItem*> s_macro_ui_items;
+
+GtkWindow*
+widget_toplevel_window(GtkWidget* w)
+{
+    if (!w)
+        return nullptr;
+    auto top = gtk_widget_get_toplevel(w);
+    return (top && GTK_IS_WINDOW(top)) ? GTK_WINDOW(top) : nullptr;
+}
+} // namespace
+
+class GncGtkMacroClassesUIItem : public GncOptionGtkUIItem
+{
+public:
+    GncGtkMacroClassesUIItem(GtkWidget* tree_view, GtkListStore* store,
+                             GtkLabel* status_label,
+                             GtkTreeViewColumn* name_col,
+                             GncOption* option);
+    ~GncGtkMacroClassesUIItem() override;
+
+    void set_ui_item_from_option(GncOption& option) noexcept override;
+    void set_option_from_ui_item(GncOption& option) noexcept override;
+
+    const std::vector<std::pair<std::string, double>>& get_macro_list() const
+    {
+        return m_macros;
+    }
+
+    void update_account_summaries(
+        const std::map<std::string, MacroAccountSummary>& summaries,
+        double outside_macros_direct);
+    void on_name_cell_edited(const gchar* path_str, const gchar* new_text,
+                             GncOption* option);
+    void on_explicit_cell_edited(const gchar* path_str, const gchar* new_text,
+                                 GncOption* option);
+    void on_add_clicked(GncOption* option);
+    void on_remove_clicked(GncOption* option);
+    void on_clear_targets_clicked(GncOption* option);
+    void on_hierarchy_changed();
+
+private:
+    void populate_list();
+    void update_status_label();
+    std::string make_unique_macro_name() const;
+    void notify_alloc_peer(const std::string& renamed_from = "",
+                           const std::string& renamed_to = "");
+
+    GtkListStore* m_store;
+    GtkLabel* m_status_label;
+    GtkTreeViewColumn* m_name_col;
+    GncOption* m_option;
+    std::vector<std::pair<std::string, double>> m_macros;
+    std::map<std::string, MacroAccountSummary> m_summaries;
+    double m_outside_macros_direct{0.0};
+    bool m_syncing{false};
+};
 
 class GncGtkAccountAllocationUIItem : public GncOptionGtkUIItem
 {
 public:
     GncGtkAccountAllocationUIItem(GtkWidget* tree_view, GtkTreeStore* store,
+                                  GtkListStore* combo_store,
                                   GtkLabel* status_label,
-                                  GtkToggleButton* show_hidden) :
+                                  GtkToggleButton* show_hidden,
+                                  GncOption* option) :
         GncOptionGtkUIItem{tree_view, GncOptionUIType::ACCOUNT_ALLOCATION},
         m_store{store},
+        m_combo_store{GTK_LIST_STORE(g_object_ref(combo_store))},
         m_status_label{status_label},
-        m_show_hidden{show_hidden} {}
+        m_show_hidden{show_hidden},
+        m_option{option}
+    {
+        s_alloc_ui_items.push_back(this);
+    }
+
+    ~GncGtkAccountAllocationUIItem() override
+    {
+        s_alloc_ui_items.erase(
+            std::remove(s_alloc_ui_items.begin(), s_alloc_ui_items.end(), this),
+            s_alloc_ui_items.end());
+        if (m_combo_store)
+            g_object_unref(m_combo_store);
+    }
 
     void set_ui_item_from_option(GncOption& option) noexcept override
     {
-        m_allocations = parse_allocation_string(option.get_value<std::string>());
+        auto parsed = parse_allocation_entries(option.get_value<std::string>());
+        m_allocations = std::move(parsed.direct);
+        m_account_macros = std::move(parsed.macros);
         populate_tree();
+        notify_macro_peer();
     }
 
     void set_option_from_ui_item(GncOption& option) noexcept override
     {
-        option.set_value(serialize_allocation_map(m_allocations));
+        option.set_value(serialize_allocation_entries(m_allocations, m_account_macros));
     }
 
     void on_direct_cell_edited(const gchar* path_str, const gchar* new_text,
@@ -2171,13 +2422,58 @@ public:
                            ALLOC_COL_DIRECT_TEXT, edit_text.c_str(),
                            -1);
         recompute_totals();
+        notify_macro_peer();
+        gnc_option_changed_widget_cb(get_widget(), option);
+    }
+
+    void on_macro_cell_edited(const gchar* path_str, const gchar* new_text,
+                              GncOption* option)
+    {
+        GtkTreeIter iter;
+        auto model = GTK_TREE_MODEL(m_store);
+        if (!gtk_tree_model_get_iter_from_string(model, &iter, path_str))
+            return;
+
+        std::string selected = new_text ? trim_ws(new_text) : std::string{};
+        if (selected == _("(None)") || selected == "(None)")
+            selected.clear();
+
+        gchar* guid = nullptr;
+        gtk_tree_model_get(model, &iter, ALLOC_COL_GUID, &guid, -1);
+        if (!guid)
+            return;
+
+        std::string prev;
+        if (auto it = m_account_macros.find(guid); it != m_account_macros.end())
+            prev = it->second;
+
+        if (prev == selected)
+        {
+            g_free(guid);
+            return;
+        }
+
+        if (!selected.empty())
+            m_account_macros[guid] = selected;
+        else
+            m_account_macros.erase(guid);
+        g_free(guid);
+
+        gtk_tree_store_set(m_store, &iter,
+                           ALLOC_COL_MACRO_NAME, selected.c_str(),
+                           -1);
+        recompute_totals();
+        notify_macro_peer();
+        refresh_macro_effective_cells();
         gnc_option_changed_widget_cb(get_widget(), option);
     }
 
     void on_clear_all(GncOption* option)
     {
         m_allocations.clear();
+        m_account_macros.clear();
         populate_tree();
+        notify_macro_peer();
         gnc_option_changed_widget_cb(get_widget(), option);
     }
 
@@ -2186,7 +2482,269 @@ public:
         populate_tree();
     }
 
+    void on_hierarchy_changed()
+    {
+        if (m_syncing)
+            return;
+        auto peer = find_macro_peer();
+        if (peer)
+            sync_from_macro_peer(peer->get_macro_list());
+    }
+
+    AllocationTotalsSnapshot compute_allocation_snapshot() const
+    {
+        AllocationTotalsSnapshot snapshot;
+        auto model = GTK_TREE_MODEL(m_store);
+        GtkTreeIter root_iter;
+        if (gtk_tree_model_get_iter_first(model, &root_iter))
+        {
+            do
+            {
+                collect_allocation_snapshot(&root_iter, "", snapshot);
+            } while (gtk_tree_model_iter_next(model, &root_iter));
+        }
+        return snapshot;
+    }
+
+    void sync_from_macro_peer(
+        const std::vector<std::pair<std::string, double>>& macro_list,
+        const std::string& renamed_from = "",
+        const std::string& renamed_to = "")
+    {
+        if (m_syncing)
+            return;
+        m_syncing = true;
+
+        bool changed = false;
+        if (!renamed_from.empty() && !renamed_to.empty() && renamed_from != renamed_to)
+        {
+            for (auto& [guid, macro] : m_account_macros)
+            {
+                if (macro == renamed_from)
+                {
+                    macro = renamed_to;
+                    changed = true;
+                }
+            }
+        }
+
+        /* Rebuild dropdown list model */
+        gtk_list_store_clear(m_combo_store);
+        GtkTreeIter combo_iter;
+        gtk_list_store_append(m_combo_store, &combo_iter);
+        gtk_list_store_set(m_combo_store, &combo_iter, 0, _("(None)"), -1);
+        for (const auto& [name, val] : macro_list)
+        {
+            gtk_list_store_append(m_combo_store, &combo_iter);
+            gtk_list_store_set(m_combo_store, &combo_iter, 0, name.c_str(), -1);
+        }
+
+        /* Remove assignments pointing to deleted macro classes */
+        for (auto it = m_account_macros.begin(); it != m_account_macros.end();)
+        {
+            bool exists = std::any_of(macro_list.begin(), macro_list.end(),
+                                      [&](const auto& p) { return p.first == it->second; });
+            if (!exists)
+            {
+                it = m_account_macros.erase(it);
+                changed = true;
+            }
+            else
+                ++it;
+        }
+
+        update_tree_macro_names_from_map();
+        auto snapshot = compute_allocation_snapshot();
+        m_macro_explicit_cache.clear();
+        m_macro_effective_cache.clear();
+        for (const auto& [name, explicit_val] : macro_list)
+        {
+            m_macro_explicit_cache[name] = explicit_val;
+            double acct_sum = 0.0;
+            if (auto sit = snapshot.summaries.find(name); sit != snapshot.summaries.end())
+                acct_sum = sit->second.accounts_sum;
+            m_macro_effective_cache[name] =
+                (explicit_val > 1e-6) ? explicit_val : acct_sum;
+        }
+        recompute_totals();
+        refresh_macro_effective_cells();
+
+        if (auto peer = find_macro_peer())
+            peer->update_account_summaries(snapshot.summaries,
+                                           snapshot.outside_macros_direct);
+
+        if (changed && m_option)
+            gnc_option_changed_widget_cb(get_widget(), m_option);
+
+        m_syncing = false;
+    }
+
 private:
+    GncGtkMacroClassesUIItem* find_macro_peer() const
+    {
+        auto top = widget_toplevel_window(get_widget());
+        if (!top)
+            return nullptr;
+        for (auto* peer : s_macro_ui_items)
+        {
+            if (widget_toplevel_window(peer->get_widget()) == top)
+                return peer;
+        }
+        return nullptr;
+    }
+
+    void notify_macro_peer()
+    {
+        if (m_syncing)
+            return;
+        auto peer = find_macro_peer();
+        if (!peer)
+            return;
+        m_syncing = true;
+        auto snapshot = compute_allocation_snapshot();
+        const auto& macro_list = peer->get_macro_list();
+        m_macro_explicit_cache.clear();
+        m_macro_effective_cache.clear();
+        for (const auto& [name, explicit_val] : macro_list)
+        {
+            m_macro_explicit_cache[name] = explicit_val;
+            double acct_sum = 0.0;
+            if (auto sit = snapshot.summaries.find(name); sit != snapshot.summaries.end())
+                acct_sum = sit->second.accounts_sum;
+            m_macro_effective_cache[name] =
+                (explicit_val > 1e-6) ? explicit_val : acct_sum;
+        }
+        recompute_totals();
+        refresh_macro_effective_cells();
+        peer->update_account_summaries(snapshot.summaries,
+                                       snapshot.outside_macros_direct);
+        m_syncing = false;
+    }
+
+    void collect_allocation_snapshot(
+        GtkTreeIter* iter,
+        const std::string& inherited_macro,
+        AllocationTotalsSnapshot& snapshot) const
+    {
+        auto model = GTK_TREE_MODEL(m_store);
+        gchar* guid_c = nullptr;
+        gchar* name_c = nullptr;
+        double direct = 0.0;
+        gtk_tree_model_get(model, iter,
+                           ALLOC_COL_GUID, &guid_c,
+                           ALLOC_COL_NAME, &name_c,
+                           ALLOC_COL_DIRECT_VAL, &direct,
+                           -1);
+        std::string guid = guid_c ? guid_c : "";
+        std::string acct_name = name_c ? name_c : "";
+        g_free(guid_c);
+        g_free(name_c);
+
+        std::string own_macro;
+        if (auto it = m_account_macros.find(guid); it != m_account_macros.end())
+            own_macro = it->second;
+
+        std::string eff_macro = !own_macro.empty() ? own_macro : inherited_macro;
+        if (eff_macro.empty())
+        {
+            snapshot.outside_macros_direct += direct;
+        }
+        else
+        {
+            snapshot.summaries[eff_macro].accounts_sum += direct;
+            if (!own_macro.empty() && own_macro != inherited_macro && !acct_name.empty())
+                snapshot.summaries[eff_macro].account_names.push_back(acct_name);
+        }
+
+        GtkTreeIter child;
+        if (gtk_tree_model_iter_children(model, &child, iter))
+        {
+            do
+            {
+                collect_allocation_snapshot(&child, eff_macro, snapshot);
+            } while (gtk_tree_model_iter_next(model, &child));
+        }
+    }
+
+    void update_tree_macro_names_subtree(GtkTreeIter* iter)
+    {
+        auto model = GTK_TREE_MODEL(m_store);
+        gchar* guid_c = nullptr;
+        gtk_tree_model_get(model, iter, ALLOC_COL_GUID, &guid_c, -1);
+        std::string macro;
+        if (guid_c)
+        {
+            if (auto it = m_account_macros.find(guid_c); it != m_account_macros.end())
+                macro = it->second;
+            g_free(guid_c);
+        }
+        gtk_tree_store_set(m_store, iter, ALLOC_COL_MACRO_NAME, macro.c_str(), -1);
+
+        GtkTreeIter child;
+        if (gtk_tree_model_iter_children(model, &child, iter))
+        {
+            do
+            {
+                update_tree_macro_names_subtree(&child);
+            } while (gtk_tree_model_iter_next(model, &child));
+        }
+    }
+
+    void update_tree_macro_names_from_map()
+    {
+        auto model = GTK_TREE_MODEL(m_store);
+        GtkTreeIter root_iter;
+        if (gtk_tree_model_get_iter_first(model, &root_iter))
+        {
+            do
+            {
+                update_tree_macro_names_subtree(&root_iter);
+            } while (gtk_tree_model_iter_next(model, &root_iter));
+        }
+    }
+
+    void refresh_macro_effective_subtree(GtkTreeIter* iter)
+    {
+        auto model = GTK_TREE_MODEL(m_store);
+        gchar* macro_c = nullptr;
+        gtk_tree_model_get(model, iter, ALLOC_COL_MACRO_NAME, &macro_c, -1);
+        std::string macro = macro_c ? macro_c : "";
+        g_free(macro_c);
+
+        std::string eff_text;
+        if (!macro.empty())
+        {
+            if (auto it = m_macro_effective_cache.find(macro);
+                it != m_macro_effective_cache.end())
+                eff_text = format_pct_display(it->second);
+        }
+        gtk_tree_store_set(m_store, iter,
+                           ALLOC_COL_MACRO_EFF_TEXT, eff_text.c_str(),
+                           -1);
+
+        GtkTreeIter child;
+        if (gtk_tree_model_iter_children(model, &child, iter))
+        {
+            do
+            {
+                refresh_macro_effective_subtree(&child);
+            } while (gtk_tree_model_iter_next(model, &child));
+        }
+    }
+
+    void refresh_macro_effective_cells()
+    {
+        auto model = GTK_TREE_MODEL(m_store);
+        GtkTreeIter root_iter;
+        if (gtk_tree_model_get_iter_first(model, &root_iter))
+        {
+            do
+            {
+                refresh_macro_effective_subtree(&root_iter);
+            } while (gtk_tree_model_iter_next(model, &root_iter));
+        }
+    }
+
     double recompute_subtree(GtkTreeIter* iter)
     {
         auto model = GTK_TREE_MODEL(m_store);
@@ -2230,24 +2788,70 @@ private:
             } while (gtk_tree_model_iter_next(model, &root_iter));
         }
 
-        double total = 0.0;
-        for (const auto& [guid, val] : m_allocations)
-            total += val;
+        auto snapshot = compute_allocation_snapshot();
+        double macro_effective_sum = 0.0;
+        std::string violated_name;
+        double violated_sum = 0.0;
+        double violated_cap = 0.0;
 
+        for (const auto& [name, explicit_val] : m_macro_explicit_cache)
+        {
+            double acct_sum = 0.0;
+            if (auto sit = snapshot.summaries.find(name); sit != snapshot.summaries.end())
+                acct_sum = sit->second.accounts_sum;
+            if (explicit_val > 1e-6 && acct_sum > explicit_val + 0.01 && violated_name.empty())
+            {
+                violated_name = name;
+                violated_sum = acct_sum;
+                violated_cap = explicit_val;
+            }
+            macro_effective_sum += (explicit_val > 1e-6) ? explicit_val : acct_sum;
+        }
+        for (const auto& [name, summary] : snapshot.summaries)
+        {
+            if (m_macro_explicit_cache.find(name) == m_macro_explicit_cache.end())
+                macro_effective_sum += summary.accounts_sum;
+        }
+
+        double total = snapshot.outside_macros_direct + macro_effective_sum;
         std::string total_str = format_allocation_number(total);
         gchar* markup = nullptr;
-        if (std::fabs(total - 100.0) <= 0.01)
+        if (!violated_name.empty())
         {
+            std::string sum_str = format_allocation_number(violated_sum);
+            std::string cap_str = format_allocation_number(violated_cap);
+            gchar* esc = g_markup_escape_text(violated_name.c_str(), -1);
             markup = g_strdup_printf(
-                "<span foreground='#1b7a2e'><b>%s: %s%% ✓</b></span>",
-                _("Total Direct Allocation"), total_str.c_str());
+                "<span foreground='#c0392b'><b>%s \"%s\": %s%% &gt; %s%%</b></span>",
+                _("Macro accounts sum exceeds target"), esc,
+                sum_str.c_str(), cap_str.c_str());
+            g_free(esc);
+        }
+        else if (std::fabs(total - 100.0) <= 0.01)
+        {
+            if (macro_effective_sum > 1e-6)
+            {
+                std::string acct_str = format_allocation_number(snapshot.outside_macros_direct);
+                std::string macro_str = format_allocation_number(macro_effective_sum);
+                markup = g_strdup_printf(
+                    "<span foreground='#1b7a2e'><b>%s: %s%% ✓ (%s: %s%% + %s: %s%%)</b></span>",
+                    _("Total Allocation"), total_str.c_str(),
+                    _("Outside Macros"), acct_str.c_str(),
+                    _("Macro Classes"), macro_str.c_str());
+            }
+            else
+            {
+                markup = g_strdup_printf(
+                    "<span foreground='#1b7a2e'><b>%s: %s%% ✓</b></span>",
+                    _("Total Allocation"), total_str.c_str());
+            }
         }
         else if (total < 100.0)
         {
             std::string rem_str = format_allocation_number(100.0 - total);
             markup = g_strdup_printf(
                 "<span foreground='#c0392b'><b>%s: %s%% (%s%% %s — %s)</b></span>",
-                _("Total Direct Allocation"), total_str.c_str(),
+                _("Total Allocation"), total_str.c_str(),
                 rem_str.c_str(), _("remaining"), _("must equal 100%"));
         }
         else
@@ -2255,7 +2859,7 @@ private:
             std::string over_str = format_allocation_number(total - 100.0);
             markup = g_strdup_printf(
                 "<span foreground='#c0392b'><b>%s: %s%% (%s%% %s — %s)</b></span>",
-                _("Total Direct Allocation"), total_str.c_str(),
+                _("Total Allocation"), total_str.c_str(),
                 over_str.c_str(), _("over"), _("must equal 100%"));
         }
         gtk_label_set_markup(m_status_label, markup);
@@ -2265,13 +2869,17 @@ private:
     void append_account_subtree(Account* acc, GtkTreeIter* parent_iter,
                                 bool show_hidden)
     {
-        if (!account_should_show(acc, show_hidden, m_allocations))
+        if (!account_should_show(acc, show_hidden, m_allocations, m_account_macros))
             return;
 
         std::string guid = account_guid_str(acc);
         double direct = 0.0;
         if (auto it = m_allocations.find(guid); it != m_allocations.end())
             direct = it->second;
+
+        std::string macro;
+        if (auto mit = m_account_macros.find(guid); mit != m_account_macros.end())
+            macro = mit->second;
 
         const char* name = xaccAccountGetName(acc);
         auto direct_text = format_pct_edit(direct);
@@ -2285,6 +2893,8 @@ private:
                            ALLOC_COL_DIRECT_TEXT, direct_text.c_str(),
                            ALLOC_COL_SUBTREE_VAL, 0.0,
                            ALLOC_COL_SUBTREE_TEXT, "",
+                           ALLOC_COL_MACRO_NAME, macro.c_str(),
+                           ALLOC_COL_MACRO_EFF_TEXT, "",
                            ALLOC_COL_WEIGHT, PANGO_WEIGHT_NORMAL,
                            -1);
 
@@ -2310,14 +2920,427 @@ private:
             g_list_free(top_accounts);
         }
         recompute_totals();
+        refresh_macro_effective_cells();
         gtk_tree_view_expand_all(GTK_TREE_VIEW(get_widget()));
     }
 
     GtkTreeStore* m_store;
+    GtkListStore* m_combo_store;
     GtkLabel* m_status_label;
     GtkToggleButton* m_show_hidden;
+    GncOption* m_option;
     std::map<std::string, double> m_allocations;
+    std::map<std::string, std::string> m_account_macros;
+    std::map<std::string, double> m_macro_explicit_cache;
+    std::map<std::string, double> m_macro_effective_cache;
+    bool m_syncing{false};
 };
+
+GncGtkMacroClassesUIItem::GncGtkMacroClassesUIItem(GtkWidget* tree_view,
+                                                   GtkListStore* store,
+                                                   GtkLabel* status_label,
+                                                   GtkTreeViewColumn* name_col,
+                                                   GncOption* option) :
+    GncOptionGtkUIItem{tree_view, GncOptionUIType::MACRO_CLASSES},
+    m_store{store},
+    m_status_label{status_label},
+    m_name_col{name_col},
+    m_option{option}
+{
+    s_macro_ui_items.push_back(this);
+}
+
+GncGtkMacroClassesUIItem::~GncGtkMacroClassesUIItem()
+{
+    s_macro_ui_items.erase(
+        std::remove(s_macro_ui_items.begin(), s_macro_ui_items.end(), this),
+        s_macro_ui_items.end());
+}
+
+void
+GncGtkMacroClassesUIItem::set_ui_item_from_option(GncOption& option) noexcept
+{
+    m_macros = parse_macro_classes_string(option.get_value<std::string>());
+    populate_list();
+    notify_alloc_peer();
+}
+
+void
+GncGtkMacroClassesUIItem::set_option_from_ui_item(GncOption& option) noexcept
+{
+    option.set_value(serialize_macro_classes(m_macros));
+}
+
+void
+GncGtkMacroClassesUIItem::update_account_summaries(
+    const std::map<std::string, MacroAccountSummary>& summaries,
+    double outside_macros_direct)
+{
+    m_summaries = summaries;
+    m_outside_macros_direct = outside_macros_direct;
+    populate_list();
+}
+
+void
+GncGtkMacroClassesUIItem::on_name_cell_edited(const gchar* path_str,
+                                              const gchar* new_text,
+                                              GncOption* option)
+{
+    auto path = gtk_tree_path_new_from_string(path_str);
+    if (!path)
+        return;
+    int* indices = gtk_tree_path_get_indices(path);
+    int idx = indices ? indices[0] : -1;
+    gtk_tree_path_free(path);
+    if (idx < 0 || static_cast<size_t>(idx) >= m_macros.size())
+        return;
+
+    std::string trimmed = new_text ? trim_ws(new_text) : std::string{};
+    if (trimmed.empty())
+        return;
+
+    std::string old_name = m_macros[idx].first;
+    if (trimmed == old_name)
+        return;
+
+    for (size_t i = 0; i < m_macros.size(); ++i)
+    {
+        if (i != static_cast<size_t>(idx) && m_macros[i].first == trimmed)
+            return;
+    }
+
+    m_macros[idx].first = trimmed;
+    if (auto sit = m_summaries.find(old_name); sit != m_summaries.end())
+    {
+        m_summaries[trimmed] = std::move(sit->second);
+        m_summaries.erase(sit);
+    }
+    populate_list();
+    notify_alloc_peer(old_name, trimmed);
+    gnc_option_changed_widget_cb(get_widget(), option);
+}
+
+void
+GncGtkMacroClassesUIItem::on_explicit_cell_edited(const gchar* path_str,
+                                                  const gchar* new_text,
+                                                  GncOption* option)
+{
+    auto path = gtk_tree_path_new_from_string(path_str);
+    if (!path)
+        return;
+    int* indices = gtk_tree_path_get_indices(path);
+    int idx = indices ? indices[0] : -1;
+    gtk_tree_path_free(path);
+    if (idx < 0 || static_cast<size_t>(idx) >= m_macros.size())
+        return;
+
+    double val = 0.0;
+    if (!parse_user_percentage(new_text, val))
+        return;
+
+    m_macros[idx].second = val;
+    populate_list();
+    notify_alloc_peer();
+    gnc_option_changed_widget_cb(get_widget(), option);
+}
+
+std::string
+GncGtkMacroClassesUIItem::make_unique_macro_name() const
+{
+    const std::string base = _("New Macro Class");
+    auto exists = [&](const std::string& candidate) {
+        return std::any_of(m_macros.begin(), m_macros.end(),
+                           [&](const auto& p) { return p.first == candidate; });
+    };
+    if (!exists(base))
+        return base;
+    for (int i = 2;; ++i)
+    {
+        std::string cand = base + " " + std::to_string(i);
+        if (!exists(cand))
+            return cand;
+    }
+}
+
+void
+GncGtkMacroClassesUIItem::on_add_clicked(GncOption* option)
+{
+    m_macros.emplace_back(make_unique_macro_name(), 0.0);
+    populate_list();
+    notify_alloc_peer();
+    gnc_option_changed_widget_cb(get_widget(), option);
+
+    auto path = gtk_tree_path_new_from_indices(
+        static_cast<gint>(m_macros.size() - 1), -1);
+    gtk_tree_view_set_cursor(GTK_TREE_VIEW(get_widget()), path, m_name_col, TRUE);
+    gtk_tree_path_free(path);
+}
+
+void
+GncGtkMacroClassesUIItem::on_remove_clicked(GncOption* option)
+{
+    auto selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(get_widget()));
+    GtkTreeModel* model = nullptr;
+    GtkTreeIter iter;
+    if (!gtk_tree_selection_get_selected(selection, &model, &iter))
+        return;
+    auto path = gtk_tree_model_get_path(model, &iter);
+    if (!path)
+        return;
+    int* indices = gtk_tree_path_get_indices(path);
+    int idx = indices ? indices[0] : -1;
+    gtk_tree_path_free(path);
+    if (idx < 0 || static_cast<size_t>(idx) >= m_macros.size())
+        return;
+
+    m_summaries.erase(m_macros[idx].first);
+    m_macros.erase(m_macros.begin() + idx);
+    populate_list();
+    notify_alloc_peer();
+    gnc_option_changed_widget_cb(get_widget(), option);
+}
+
+void
+GncGtkMacroClassesUIItem::on_clear_targets_clicked(GncOption* option)
+{
+    for (auto& [name, val] : m_macros)
+        val = 0.0;
+    populate_list();
+    notify_alloc_peer();
+    gnc_option_changed_widget_cb(get_widget(), option);
+}
+
+void
+GncGtkMacroClassesUIItem::on_hierarchy_changed()
+{
+    notify_alloc_peer();
+}
+
+void
+GncGtkMacroClassesUIItem::notify_alloc_peer(const std::string& renamed_from,
+                                            const std::string& renamed_to)
+{
+    if (m_syncing)
+        return;
+    auto top = widget_toplevel_window(get_widget());
+    if (!top)
+        return;
+    m_syncing = true;
+    for (auto* peer : s_alloc_ui_items)
+    {
+        if (widget_toplevel_window(peer->get_widget()) == top)
+            peer->sync_from_macro_peer(m_macros, renamed_from, renamed_to);
+    }
+    m_syncing = false;
+}
+
+void
+GncGtkMacroClassesUIItem::update_status_label()
+{
+    double eff_sum = 0.0;
+    std::string violated_name;
+    double violated_sum = 0.0;
+    double violated_cap = 0.0;
+    for (const auto& [name, explicit_val] : m_macros)
+    {
+        double acct_sum = 0.0;
+        if (auto it = m_summaries.find(name); it != m_summaries.end())
+            acct_sum = it->second.accounts_sum;
+        if (explicit_val > 1e-6 && acct_sum > explicit_val + 0.01 && violated_name.empty())
+        {
+            violated_name = name;
+            violated_sum = acct_sum;
+            violated_cap = explicit_val;
+        }
+        eff_sum += (explicit_val > 1e-6) ? explicit_val : acct_sum;
+    }
+
+    double grand_total = m_outside_macros_direct + eff_sum;
+    std::string macro_str = format_allocation_number(eff_sum);
+    std::string total_str = format_allocation_number(grand_total);
+    gchar* markup = nullptr;
+    if (!violated_name.empty())
+    {
+        std::string vsum_str = format_allocation_number(violated_sum);
+        std::string vcap_str = format_allocation_number(violated_cap);
+        gchar* esc = g_markup_escape_text(violated_name.c_str(), -1);
+        markup = g_strdup_printf(
+            "<span foreground='#c0392b'><b>%s: %zu  |  %s \"%s\": %s%% &gt; %s%%</b></span>",
+            _("Macro Classes"), m_macros.size(),
+            _("Accounts sum exceeds target in"), esc,
+            vsum_str.c_str(), vcap_str.c_str());
+        g_free(esc);
+    }
+    else if (std::fabs(grand_total - 100.0) <= 0.01)
+    {
+        markup = g_strdup_printf(
+            "<span foreground='#1b7a2e'><b>%s: %zu (%s%%)  |  %s: %s%% ✓</b></span>",
+            _("Macro Classes"), m_macros.size(), macro_str.c_str(),
+            _("Total Allocation"), total_str.c_str());
+    }
+    else
+    {
+        markup = g_strdup_printf(
+            "<span foreground='#c0392b'><b>%s: %zu (%s%%)  |  %s: %s%% (%s)</b></span>",
+            _("Macro Classes"), m_macros.size(), macro_str.c_str(),
+            _("Total Allocation"), total_str.c_str(), _("must equal 100%"));
+    }
+    gtk_label_set_markup(m_status_label, markup);
+    g_free(markup);
+}
+
+void
+GncGtkMacroClassesUIItem::populate_list()
+{
+    gtk_list_store_clear(m_store);
+    for (const auto& [name, explicit_val] : m_macros)
+    {
+        double acct_sum = 0.0;
+        std::string accts_desc = "—";
+        if (auto it = m_summaries.find(name); it != m_summaries.end())
+        {
+            acct_sum = it->second.accounts_sum;
+            const auto& names = it->second.account_names;
+            if (!names.empty())
+            {
+                std::ostringstream oss;
+                oss << names.size() << " (";
+                size_t show_cnt = std::min<size_t>(names.size(), 4);
+                for (size_t i = 0; i < show_cnt; ++i)
+                {
+                    if (i > 0)
+                        oss << ", ";
+                    oss << names[i];
+                }
+                if (names.size() > show_cnt)
+                    oss << ", +" << (names.size() - show_cnt);
+                oss << ")";
+                accts_desc = oss.str();
+            }
+        }
+        if (explicit_val > 1e-6 && acct_sum > explicit_val + 0.01)
+            accts_desc += std::string{" ["} + _("EXCEEDS TARGET!") + "]";
+        double effective = (explicit_val > 1e-6) ? explicit_val : acct_sum;
+        auto explicit_text = format_pct_edit(explicit_val);
+        auto sum_text = format_pct_display(acct_sum);
+        auto eff_text = format_pct_display(effective);
+
+        GtkTreeIter iter;
+        gtk_list_store_append(m_store, &iter);
+        gtk_list_store_set(m_store, &iter,
+                           MACRO_COL_NAME, name.c_str(),
+                           MACRO_COL_EXPLICIT_VAL, explicit_val,
+                           MACRO_COL_EXPLICIT_TEXT, explicit_text.c_str(),
+                           MACRO_COL_ACCTS_SUM_VAL, acct_sum,
+                           MACRO_COL_ACCTS_SUM_TEXT, sum_text.c_str(),
+                           MACRO_COL_EFFECTIVE_VAL, effective,
+                           MACRO_COL_EFFECTIVE_TEXT, eff_text.c_str(),
+                           MACRO_COL_ACCOUNTS_DESC, accts_desc.c_str(),
+                           -1);
+    }
+    update_status_label();
+}
+
+static void
+allocation_macro_cell_edited_cb(GtkCellRendererText* cell, gchar* path_str,
+                                gchar* new_text, gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkAccountAllocationUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_macro_cell_edited(path_str, new_text, option);
+}
+
+static void
+allocation_hierarchy_changed_cb(GtkWidget* widget, GtkWidget* previous_toplevel,
+                                gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkAccountAllocationUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_hierarchy_changed();
+}
+
+static void
+macro_name_cell_edited_cb(GtkCellRendererText* cell, gchar* path_str,
+                          gchar* new_text, gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkMacroClassesUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_name_cell_edited(path_str, new_text, option);
+}
+
+static void
+macro_explicit_cell_edited_cb(GtkCellRendererText* cell, gchar* path_str,
+                              gchar* new_text, gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkMacroClassesUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_explicit_cell_edited(path_str, new_text, option);
+}
+
+static void
+macro_add_clicked_cb(GtkButton* button, gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkMacroClassesUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_add_clicked(option);
+}
+
+static void
+macro_remove_clicked_cb(GtkButton* button, gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkMacroClassesUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_remove_clicked(option);
+}
+
+static void
+macro_clear_targets_clicked_cb(GtkButton* button, gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkMacroClassesUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_clear_targets_clicked(option);
+}
+
+static void
+macro_hierarchy_changed_cb(GtkWidget* widget, GtkWidget* previous_toplevel,
+                           gpointer data)
+{
+    auto option = static_cast<GncOption*>(data);
+    if (!option)
+        return;
+    auto ui_item =
+        dynamic_cast<GncGtkMacroClassesUIItem*>(option->get_ui_item());
+    if (ui_item)
+        ui_item->on_hierarchy_changed();
+}
 
 static void
 allocation_direct_cell_edited_cb(GtkCellRendererText* cell, gchar* path_str,
@@ -2384,9 +3407,16 @@ create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>(GncOption& option,
                                     G_TYPE_STRING,
                                     G_TYPE_DOUBLE,
                                     G_TYPE_STRING,
+                                    G_TYPE_STRING,
+                                    G_TYPE_STRING,
                                     G_TYPE_INT);
     auto tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
     g_object_unref(store);
+
+    auto combo_store = gtk_list_store_new(1, G_TYPE_STRING);
+    GtkTreeIter combo_iter;
+    gtk_list_store_append(combo_store, &combo_iter);
+    gtk_list_store_set(combo_store, &combo_iter, 0, _("(None)"), -1);
 
     gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree_view), TRUE);
     gtk_tree_view_set_enable_tree_lines(GTK_TREE_VIEW(tree_view), TRUE);
@@ -2400,7 +3430,7 @@ create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>(GncOption& option,
         nullptr);
     gtk_tree_view_column_set_expand(acct_col, TRUE);
     gtk_tree_view_column_set_resizable(acct_col, TRUE);
-    gtk_tree_view_column_set_min_width(acct_col, 320);
+    gtk_tree_view_column_set_min_width(acct_col, 280);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), acct_col);
 
     /* Column 1: Direct Target (%) editable cell */
@@ -2416,7 +3446,7 @@ create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>(GncOption& option,
         "text", ALLOC_COL_DIRECT_TEXT,
         nullptr);
     gtk_tree_view_column_set_alignment(direct_col, 1.0);
-    gtk_tree_view_column_set_min_width(direct_col, 140);
+    gtk_tree_view_column_set_min_width(direct_col, 120);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), direct_col);
 
     /* Column 2: Effective Subtree Total (%) read-only cell */
@@ -2428,8 +3458,37 @@ create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>(GncOption& option,
         "weight", ALLOC_COL_WEIGHT,
         nullptr);
     gtk_tree_view_column_set_alignment(subtree_col, 1.0);
-    gtk_tree_view_column_set_min_width(subtree_col, 140);
+    gtk_tree_view_column_set_min_width(subtree_col, 125);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), subtree_col);
+
+    /* Column 3: Macro Class dropdown selector */
+    auto macro_renderer = gtk_cell_renderer_combo_new();
+    g_object_set(G_OBJECT(macro_renderer),
+                 "model", GTK_TREE_MODEL(combo_store),
+                 "text-column", 0,
+                 "has-entry", FALSE,
+                 "editable", TRUE,
+                 nullptr);
+    g_signal_connect(G_OBJECT(macro_renderer), "edited",
+                     G_CALLBACK(allocation_macro_cell_edited_cb), &option);
+    auto macro_col = gtk_tree_view_column_new_with_attributes(
+        _("Macro Class"), macro_renderer,
+        "text", ALLOC_COL_MACRO_NAME,
+        nullptr);
+    gtk_tree_view_column_set_resizable(macro_col, TRUE);
+    gtk_tree_view_column_set_min_width(macro_col, 160);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), macro_col);
+
+    /* Column 4: Assigned Macro Class Effective Target (%) read-only cell */
+    auto macro_eff_renderer = gtk_cell_renderer_text_new();
+    g_object_set(G_OBJECT(macro_eff_renderer), "xalign", 1.0, nullptr);
+    auto macro_eff_col = gtk_tree_view_column_new_with_attributes(
+        _("Macro Effective (%)"), macro_eff_renderer,
+        "text", ALLOC_COL_MACRO_EFF_TEXT,
+        nullptr);
+    gtk_tree_view_column_set_alignment(macro_eff_col, 1.0);
+    gtk_tree_view_column_set_min_width(macro_eff_col, 125);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), macro_eff_col);
 
     auto frame = gtk_frame_new(_(option.get_name().c_str()));
     gtk_widget_set_hexpand(frame, TRUE);
@@ -2440,7 +3499,7 @@ create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>(GncOption& option,
     gtk_container_add(GTK_CONTAINER(frame), vbox);
 
     auto help_label = gtk_label_new(
-        _("Click a cell in \"Direct Target (%)\" to enter an account's direct allocation percentage (press Enter to confirm). Parent effective totals roll up automatically from subaccounts. Direct targets must sum to 100%."));
+        _("Enter \"Direct Target (%)\" per account and optionally assign a \"Macro Class\" (virtual parent). Accounts inside a macro class must have direct targets summing <= the macro class target, and outside accounts + macro classes must sum to 100%."));
     gtk_label_set_line_wrap(GTK_LABEL(help_label), TRUE);
     gtk_widget_set_halign(help_label, GTK_ALIGN_START);
     gtk_label_set_xalign(GTK_LABEL(help_label), 0.0);
@@ -2452,7 +3511,7 @@ create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>(GncOption& option,
                                    GTK_POLICY_AUTOMATIC);
     gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(scroll_win),
                                         GTK_SHADOW_IN);
-    gtk_widget_set_size_request(scroll_win, 700, 420);
+    gtk_widget_set_size_request(scroll_win, 780, 420);
     gtk_widget_set_hexpand(scroll_win, TRUE);
     gtk_widget_set_vexpand(scroll_win, TRUE);
     gtk_container_add(GTK_CONTAINER(scroll_win), tree_view);
@@ -2479,10 +3538,13 @@ create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>(GncOption& option,
     gtk_box_pack_start(GTK_BOX(vbox), controls_box, FALSE, FALSE, 0);
 
     option.set_ui_item(std::make_unique<GncGtkAccountAllocationUIItem>(
-        tree_view, store, GTK_LABEL(status_label),
-        GTK_TOGGLE_BUTTON(show_hidden_btn)));
+        tree_view, store, combo_store, GTK_LABEL(status_label),
+        GTK_TOGGLE_BUTTON(show_hidden_btn), &option));
+    g_object_unref(combo_store);
     option.set_ui_item_from_option();
 
+    g_signal_connect(G_OBJECT(tree_view), "hierarchy-changed",
+                     G_CALLBACK(allocation_hierarchy_changed_cb), &option);
     g_signal_connect(G_OBJECT(show_hidden_btn), "toggled",
                      G_CALLBACK(allocation_show_hidden_toggled_cb), &option);
     g_signal_connect(G_OBJECT(expand_btn), "clicked",
@@ -2491,6 +3553,154 @@ create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>(GncOption& option,
                      G_CALLBACK(allocation_collapse_all_cb), tree_view);
     g_signal_connect(G_OBJECT(clear_btn), "clicked",
                      G_CALLBACK(allocation_clear_all_cb), &option);
+
+    set_tool_tip(option, frame);
+    gtk_widget_set_halign(GTK_WIDGET(page_box), GTK_ALIGN_FILL);
+    gtk_widget_set_hexpand(GTK_WIDGET(page_box), TRUE);
+    gtk_widget_set_vexpand(GTK_WIDGET(page_box), TRUE);
+    gtk_widget_show_all(frame);
+    gtk_grid_attach(GTK_GRID(page_box), frame, 0, row, 2, 1);
+}
+
+template<> void
+create_option_widget<GncOptionUIType::MACRO_CLASSES>(GncOption& option,
+                                                     GtkGrid *page_box,
+                                                     int row)
+{
+    auto store = gtk_list_store_new(NUM_MACRO_COLS,
+                                    G_TYPE_STRING,
+                                    G_TYPE_DOUBLE,
+                                    G_TYPE_STRING,
+                                    G_TYPE_DOUBLE,
+                                    G_TYPE_STRING,
+                                    G_TYPE_DOUBLE,
+                                    G_TYPE_STRING,
+                                    G_TYPE_STRING);
+    auto tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+    g_object_unref(store);
+
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(tree_view), TRUE);
+
+    /* Column 0: Macro Class name (editable) */
+    auto name_renderer = gtk_cell_renderer_text_new();
+    g_object_set(G_OBJECT(name_renderer), "editable", TRUE, nullptr);
+    g_signal_connect(G_OBJECT(name_renderer), "edited",
+                     G_CALLBACK(macro_name_cell_edited_cb), &option);
+    auto name_col = gtk_tree_view_column_new_with_attributes(
+        _("Macro Class"), name_renderer,
+        "text", MACRO_COL_NAME,
+        nullptr);
+    gtk_tree_view_column_set_expand(name_col, TRUE);
+    gtk_tree_view_column_set_resizable(name_col, TRUE);
+    gtk_tree_view_column_set_min_width(name_col, 220);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), name_col);
+
+    /* Column 1: Explicit Target (%) (editable; 0 or empty inherits Accounts Sum) */
+    auto explicit_renderer = gtk_cell_renderer_text_new();
+    g_object_set(G_OBJECT(explicit_renderer),
+                 "editable", TRUE,
+                 "xalign", 1.0,
+                 nullptr);
+    g_signal_connect(G_OBJECT(explicit_renderer), "edited",
+                     G_CALLBACK(macro_explicit_cell_edited_cb), &option);
+    auto explicit_col = gtk_tree_view_column_new_with_attributes(
+        _("Target (%)"), explicit_renderer,
+        "text", MACRO_COL_EXPLICIT_TEXT,
+        nullptr);
+    gtk_tree_view_column_set_alignment(explicit_col, 1.0);
+    gtk_tree_view_column_set_min_width(explicit_col, 110);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), explicit_col);
+
+    /* Column 2: Sum of Assigned Account Effective Targets (%) */
+    auto sum_renderer = gtk_cell_renderer_text_new();
+    g_object_set(G_OBJECT(sum_renderer), "xalign", 1.0, nullptr);
+    auto sum_col = gtk_tree_view_column_new_with_attributes(
+        _("Accounts Sum (%)"), sum_renderer,
+        "text", MACRO_COL_ACCTS_SUM_TEXT,
+        nullptr);
+    gtk_tree_view_column_set_alignment(sum_col, 1.0);
+    gtk_tree_view_column_set_min_width(sum_col, 130);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), sum_col);
+
+    /* Column 3: Effective Target (%) = Target > 0 ? Target : Accounts Sum */
+    auto eff_renderer = gtk_cell_renderer_text_new();
+    g_object_set(G_OBJECT(eff_renderer),
+                 "xalign", 1.0,
+                 "weight", PANGO_WEIGHT_BOLD,
+                 nullptr);
+    auto eff_col = gtk_tree_view_column_new_with_attributes(
+        _("Effective Target (%)"), eff_renderer,
+        "text", MACRO_COL_EFFECTIVE_TEXT,
+        nullptr);
+    gtk_tree_view_column_set_alignment(eff_col, 1.0);
+    gtk_tree_view_column_set_min_width(eff_col, 140);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), eff_col);
+
+    /* Column 4: Assigned Accounts summary */
+    auto accts_renderer = gtk_cell_renderer_text_new();
+    auto accts_col = gtk_tree_view_column_new_with_attributes(
+        _("Assigned Accounts"), accts_renderer,
+        "text", MACRO_COL_ACCOUNTS_DESC,
+        nullptr);
+    gtk_tree_view_column_set_expand(accts_col, TRUE);
+    gtk_tree_view_column_set_resizable(accts_col, TRUE);
+    gtk_tree_view_column_set_min_width(accts_col, 200);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), accts_col);
+
+    auto frame = gtk_frame_new(_(option.get_name().c_str()));
+    gtk_widget_set_hexpand(frame, TRUE);
+    gtk_widget_set_vexpand(frame, TRUE);
+
+    auto vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 6);
+    gtk_container_add(GTK_CONTAINER(frame), vbox);
+
+    auto help_label = gtk_label_new(
+        _("Define macro classes (virtual parents composing the 100% total) here, then assign accounts to them in the Allocation tab. The sum of account targets inside each macro class must be <= its Target (%), or leave Target empty/0 to inherit the sum."));
+    gtk_label_set_line_wrap(GTK_LABEL(help_label), TRUE);
+    gtk_widget_set_halign(help_label, GTK_ALIGN_START);
+    gtk_label_set_xalign(GTK_LABEL(help_label), 0.0);
+    gtk_box_pack_start(GTK_BOX(vbox), help_label, FALSE, FALSE, 0);
+
+    auto scroll_win = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_win),
+                                   GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(scroll_win),
+                                        GTK_SHADOW_IN);
+    gtk_widget_set_size_request(scroll_win, 780, 400);
+    gtk_widget_set_hexpand(scroll_win, TRUE);
+    gtk_widget_set_vexpand(scroll_win, TRUE);
+    gtk_container_add(GTK_CONTAINER(scroll_win), tree_view);
+    gtk_box_pack_start(GTK_BOX(vbox), scroll_win, TRUE, TRUE, 0);
+
+    auto status_label = gtk_label_new("");
+    gtk_widget_set_halign(status_label, GTK_ALIGN_START);
+    gtk_label_set_xalign(GTK_LABEL(status_label), 0.0);
+
+    auto add_btn = gtk_button_new_with_label(_("Add Macro Class"));
+    auto remove_btn = gtk_button_new_with_label(_("Remove Selected"));
+    auto clear_btn = gtk_button_new_with_label(_("Clear Targets"));
+
+    auto controls_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(controls_box), status_label, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(controls_box), clear_btn, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(controls_box), remove_btn, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(controls_box), add_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), controls_box, FALSE, FALSE, 0);
+
+    option.set_ui_item(std::make_unique<GncGtkMacroClassesUIItem>(
+        tree_view, store, GTK_LABEL(status_label), name_col, &option));
+    option.set_ui_item_from_option();
+
+    g_signal_connect(G_OBJECT(tree_view), "hierarchy-changed",
+                     G_CALLBACK(macro_hierarchy_changed_cb), &option);
+    g_signal_connect(G_OBJECT(add_btn), "clicked",
+                     G_CALLBACK(macro_add_clicked_cb), &option);
+    g_signal_connect(G_OBJECT(remove_btn), "clicked",
+                     G_CALLBACK(macro_remove_clicked_cb), &option);
+    g_signal_connect(G_OBJECT(clear_btn), "clicked",
+                     G_CALLBACK(macro_clear_targets_clicked_cb), &option);
 
     set_tool_tip(option, frame);
     gtk_widget_set_halign(GTK_WIDGET(page_box), GTK_ALIGN_FILL);
@@ -2545,6 +3755,8 @@ gnc_options_ui_factory_initialize(void)
                                  create_option_widget<GncOptionUIType::DATE_FORMAT>);
     GncOptionUIFactory::set_func(GncOptionUIType::ACCOUNT_ALLOCATION,
                                  create_option_widget<GncOptionUIType::ACCOUNT_ALLOCATION>);
+    GncOptionUIFactory::set_func(GncOptionUIType::MACRO_CLASSES,
+                                 create_option_widget<GncOptionUIType::MACRO_CLASSES>);
 
 
 }
